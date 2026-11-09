@@ -8,6 +8,17 @@ export const SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 interface SessionPayload {
   iat: number // issued-at, unix seconds
   exp: number // expiry, unix seconds
+  pwf?: string // ADMIN_PASSWORD fingerprint: changing the password revokes existing sessions
+}
+
+export const MIN_ADMIN_PASSWORD_LENGTH = 12
+
+/** Human-readable problem with ADMIN_PASSWORD, or null when it is acceptable. */
+export function adminPasswordProblem(pw = process.env.ADMIN_PASSWORD): string | null {
+  if (!pw) return 'ADMIN_PASSWORD is not set. Set it in .env.local.'
+  if (pw.length < MIN_ADMIN_PASSWORD_LENGTH)
+    return `ADMIN_PASSWORD must be at least ${MIN_ADMIN_PASSWORD_LENGTH} characters (currently ${pw.length}). Change it in .env.local.`
+  return null
 }
 
 const enc = new TextEncoder()
@@ -49,16 +60,32 @@ async function hmacKey(secret: string): Promise<CryptoKey> {
   ])
 }
 
-export async function signSessionToken(secret: string, now = Date.now()): Promise<string> {
+/** First 16 hex chars of HMAC-SHA256(secret, ADMIN_PASSWORD). Embedded in the session payload. */
+export async function passwordFingerprint(secret: string, password = process.env.ADMIN_PASSWORD ?? ''): Promise<string> {
+  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', await hmacKey(secret), enc.encode('pwf:' + password)))
+  let hex = ''
+  for (const b of mac.subarray(0, 8)) hex += b.toString(16).padStart(2, '0')
+  return hex
+}
+
+/** `pwf` (password fingerprint) is included when given; verify with the same value. */
+export async function signSessionToken(secret: string, now = Date.now(), pwf?: string): Promise<string> {
   const iat = Math.floor(now / 1000)
-  const payload: SessionPayload = { iat, exp: iat + SESSION_TTL_SECONDS }
+  const payload: SessionPayload = { iat, exp: iat + SESSION_TTL_SECONDS, ...(pwf ? { pwf } : {}) }
   const body = b64urlEncode(enc.encode(JSON.stringify(payload)))
   const sig = new Uint8Array(await crypto.subtle.sign('HMAC', await hmacKey(secret), enc.encode(body)))
   return `${body}.${b64urlEncode(sig)}`
 }
 
-/** Constant-time HMAC verification (crypto.subtle.verify) plus expiry check. */
-export async function verifySessionToken(secret: string, token: string | undefined | null): Promise<boolean> {
+/**
+ * Constant-time HMAC verification (crypto.subtle.verify) plus expiry check.
+ * When `pwf` is given, the token must carry the same password fingerprint.
+ */
+export async function verifySessionToken(
+  secret: string,
+  token: string | undefined | null,
+  pwf?: string,
+): Promise<boolean> {
   if (!token || token.length > 512) return false
   const dot = token.indexOf('.')
   if (dot <= 0 || dot !== token.lastIndexOf('.')) return false
@@ -72,6 +99,7 @@ export async function verifySessionToken(secret: string, token: string | undefin
   try {
     const p = JSON.parse(new TextDecoder().decode(raw)) as Partial<SessionPayload>
     const now = Math.floor(Date.now() / 1000)
+    if (pwf !== undefined && p.pwf !== pwf) return false
     return typeof p.exp === 'number' && typeof p.iat === 'number' && p.exp > now && p.iat <= now + 60
   } catch {
     return false

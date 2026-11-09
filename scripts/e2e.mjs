@@ -1,8 +1,15 @@
 // End-to-end test over HTTP against a running server.
 // Usage: node scripts/e2e.mjs [baseUrl]   (default http://localhost:3100)
-// Reads ADMIN_PASSWORD from env or .env.local. Uses no email (signs via API with tokens).
+// Reads ADMIN_PASSWORD from env or .env.local. Signs via API with tokens (no email needed).
+//
+// IMPORTANT: run the server under test with MAIL_DISABLED=1 and its own DATA_DIR, otherwise the
+// real RESEND_API_KEY in .env.local sends mail to the test addresses. In PowerShell:
+//   $env:MAIL_DISABLED='1'; $env:DATA_DIR="$env:TEMP\esign-e2e"; npx next start -H 127.0.0.1 -p 3195
+//   node scripts/e2e.mjs http://localhost:3195
+// ($env:RESEND_API_KEY='' does NOT work: it deletes the variable and Next falls back to .env.local.)
 import fs from 'node:fs'
 import path from 'node:path'
+import zlib from 'node:zlib'
 import { PDFDocument, StandardFonts } from 'pdf-lib'
 
 const BASE = process.argv[2] || 'http://localhost:3100'
@@ -24,6 +31,30 @@ const ok = (cond, msg) => {
 const PNG =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAAUCAYAAADRA14pAAAAlUlEQVR4nO3WMRKAIBADQB5h7cP8/z/OSgvnhuHOkABaXAchq6ND2fajfGnkBX7wQmBzZkmwB5XBR8BS0Uxs6wOZEhwFsNA2ApaFtguMDEcU7oG2JxgRjizaLWuKtwLYf2cgwrt/d8j/QdOiaKgYXe2VQSguDZleblYrSH5DQnV6cwALGkVXMzIHKKCwXuri9JEXYM8JJQ9DuuWDIRcAAAAASUVORK5CYII='
 
+/** All-transparent RGBA PNG of the given size, used to test the signature size cap. */
+function blankPng(W, H) {
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4)
+    len.writeUInt32BE(data.length)
+    const td = Buffer.concat([Buffer.from(type, 'latin1'), data])
+    const crc = Buffer.alloc(4)
+    crc.writeUInt32BE(zlib.crc32(td))
+    return Buffer.concat([len, td, crc])
+  }
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(W, 0)
+  ihdr.writeUInt32BE(H, 4)
+  ihdr[8] = 8
+  ihdr[9] = 6
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', zlib.deflateSync(Buffer.alloc((W * 4 + 1) * H))),
+    chunk('IEND', Buffer.alloc(0)),
+  ])
+  return 'data:image/png;base64,' + png.toString('base64')
+}
+
 async function main() {
   // sample PDF
   const doc = await PDFDocument.create()
@@ -40,6 +71,9 @@ async function main() {
 
   r = await fetch(`${BASE}/api/admin/documents/x`)
   ok(r.status === 401, 'admin API without session -> 401')
+
+  r = await fetch(`${BASE}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json', origin: 'https://evil.example' }, body: JSON.stringify({ password: PASSWORD }) })
+  ok(r.status === 403, `cross-origin login -> 403 (${r.status})`)
 
   r = await fetch(`${BASE}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: PASSWORD }) })
   ok(r.ok, `login -> ${r.status}`)
@@ -94,6 +128,16 @@ async function main() {
   const sent = await r.json()
   ok(r.ok, `send -> ${r.status} ${JSON.stringify(sent).slice(0, 120)}`)
 
+  // CSRF: a state-changing admin call with a foreign Origin is refused even with a valid cookie
+  r = await fetch(`${BASE}/api/admin/documents/${id}/resend`, { method: 'POST', headers: { ...H, origin: 'https://evil.example' } })
+  ok(r.status === 403, `cross-origin admin POST -> 403 (${r.status})`)
+  r = await fetch(`${BASE}/api/admin/documents/${id}`, { method: 'DELETE', headers: { ...H, origin: 'https://evil.example' } })
+  ok(r.status === 403, `cross-origin admin DELETE -> 403 (${r.status})`)
+
+  // a document in progress cannot be deleted (must be voided first)
+  r = await fetch(`${BASE}/api/admin/documents/${id}`, { method: 'DELETE', headers: H })
+  ok(r.status === 409, `delete of sent document -> 409 (${r.status})`)
+
   // external cannot sign before owner
   r = await fetch(`${BASE}/api/sign/${other.token}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ signaturePng: PNG, values: { [textField.id]: '상대회사' }, consent: true }) })
   ok(r.status >= 400, `out-of-order sign refused -> ${r.status}`)
@@ -105,6 +149,10 @@ async function main() {
 
   r = await fetch(`${BASE}/api/sign/${other.token}/file`)
   ok(r.ok && (await r.arrayBuffer()).byteLength > 100, 'signer can fetch PDF')
+
+  // oversized signature image (3200x10 > 3000x1500 cap) is rejected before saving
+  r = await fetch(`${BASE}/api/sign/${owner.token}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ signaturePng: blankPng(3200, 10), values: {}, consent: true }) })
+  ok(r.status === 400, `oversized signature PNG -> 400 (${r.status})`)
 
   // owner signs
   r = await fetch(`${BASE}/api/sign/${owner.token}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ signaturePng: PNG, values: {}, consent: true }) })
@@ -138,6 +186,23 @@ async function main() {
 
   r = await fetch(`${BASE}/api/admin/documents/${id}/file?kind=signed`, { headers: H })
   ok(r.ok, `admin sealed download -> ${r.status}`)
+
+  // completed document: resend re-sends the completion mail (fresh download links) to every signer
+  r = await fetch(`${BASE}/api/admin/documents/${id}/resend`, { method: 'POST', headers: H })
+  const rs = await r.json()
+  ok(
+    r.ok && rs.notifiedAll?.length === 2 && rs.notifiedAll.every((n) => n.link.endsWith('/download')),
+    `resend on completed -> ${r.status}, ${rs.notifiedAll?.length} links`,
+  )
+
+  // a draft can be deleted; same-origin DELETE is allowed
+  const fd2 = new FormData()
+  fd2.append('file', new Blob([pdfBytes], { type: 'application/pdf' }), 'del.pdf')
+  fd2.append('title', 'E2E delete')
+  r = await fetch(`${BASE}/api/admin/documents`, { method: 'POST', headers: H, body: fd2 })
+  const d2 = await r.json()
+  r = await fetch(`${BASE}/api/admin/documents/${d2.id}`, { method: 'DELETE', headers: { ...H, origin: new URL(BASE).origin } })
+  ok(r.ok, `delete draft (same-origin) -> ${r.status}`)
 
   console.log(failures ? `\n${failures} FAILED` : '\nALL PASS  (sealed copy: data/e2e-sealed.pdf)')
   process.exit(failures ? 1 : 0)

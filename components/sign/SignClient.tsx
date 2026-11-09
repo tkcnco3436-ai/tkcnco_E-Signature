@@ -1,10 +1,10 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import PdfPages from '@/components/PdfPages'
 import SignaturePad from '@/components/sign/SignaturePad'
 import type { SignField, SignSubmitBody, SignViewResponse } from '@/components/sign/types'
-import type { DocumentStatus, SignerStatus } from '@/lib/types'
+import { DOC_STATUS_LABEL, SIGNER_STATUS_LABEL } from '@/components/labels'
 
 const CONSENT_TEXT = '본 문서 내용을 확인했으며 전자서명에 동의합니다. 전자서명은 자필 서명과 동일한 효력을 가집니다.'
 const SIG_KEY = '__signature__'
@@ -21,19 +21,6 @@ function formatDateTime(iso: string | null): string {
   } catch {
     return iso
   }
-}
-
-const DOC_STATUS: Record<DocumentStatus, string> = {
-  draft: '준비 중',
-  sent: '서명 진행 중',
-  completed: '서명 완료',
-  voided: '취소됨',
-}
-const SIGNER_STATUS: Record<SignerStatus, string> = {
-  pending: '대기',
-  sent: '서명 요청됨',
-  viewed: '열람함',
-  signed: '서명함',
 }
 
 type LoadState = { kind: 'loading' } | { kind: 'notfound' } | { kind: 'error'; message: string } | { kind: 'ready'; data: SignViewResponse }
@@ -59,6 +46,21 @@ export default function SignClient({ token }: { token: string }) {
   useEffect(() => {
     void load()
   }, [load])
+
+  // After submitting: re-read status/progress without flashing the loading screen.
+  const finish = useCallback(
+    async (r: { completed: boolean }) => {
+      try {
+        const res = await fetch(base, { cache: 'no-store' })
+        const body = res.ok ? await res.json().catch(() => null) : null
+        if (body) setState({ kind: 'ready', data: body as SignViewResponse })
+      } catch {
+        // Keep the previous data; the completion notice is still correct.
+      }
+      setDone(r)
+    },
+    [base],
+  )
 
   if (state.kind === 'loading') {
     return (
@@ -159,12 +161,12 @@ export default function SignClient({ token }: { token: string }) {
     )
   }
 
-  return <SignForm data={data} base={base} onDone={setDone} />
+  return <SignForm data={data} base={base} onDone={finish} />
 }
 
 /* ---------------------------------------------------------------- signing form */
 
-function SignForm({ data, base, onDone }: { data: SignViewResponse; base: string; onDone: (r: { completed: boolean }) => void }) {
+function SignForm({ data, base, onDone }: { data: SignViewResponse; base: string; onDone: (r: { completed: boolean }) => Promise<void> }) {
   const { signer } = data
   const myFields = useMemo(
     () => data.fields.filter((f) => f.mine).sort((a, b) => a.page - b.page || a.y - b.y || a.x - b.x),
@@ -187,7 +189,22 @@ function SignForm({ data, base, onDone }: { data: SignViewResponse; base: string
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [flashId, setFlashId] = useState<string | null>(null)
+  const [editingId, setEditingId] = useState<string | null>(null)
   const consentRef = useRef<HTMLInputElement>(null)
+  const textFields = useMemo(() => myFields.filter((f) => f.type !== 'signature'), [myFields])
+
+  // Bring a field into the upper part of the screen so the bottom sheet does not cover it.
+  const revealField = (id: string) => {
+    const el = document.getElementById(`field-${id}`)
+    if (!el) return
+    const r = el.getBoundingClientRect()
+    const target = window.scrollY + r.top - Math.max(16, window.innerHeight * 0.22)
+    window.scrollTo({ top: Math.max(0, target), behavior: 'smooth' })
+  }
+  const openEditor = (id: string) => {
+    setEditingId(id)
+    revealField(id)
+  }
 
   const isDone = (f: SignField) => (f.type === 'signature' ? !!signature : (values[f.id] ?? '').trim().length > 0)
   const incomplete = myFields.filter((f) => !isDone(f))
@@ -203,6 +220,7 @@ function SignForm({ data, base, onDone }: { data: SignViewResponse; base: string
       consentRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
       return
     }
+    if (next.type !== 'signature') return openEditor(next.id)
     const el = document.getElementById(`field-${next.id}`)
     if (!el) return
     el.scrollIntoView({ behavior: 'smooth', block: 'center' })
@@ -232,7 +250,7 @@ function SignForm({ data, base, onDone }: { data: SignViewResponse; base: string
         setSubmitting(false)
         return
       }
-      onDone({ completed: !!json?.completed })
+      await onDone({ completed: !!json?.completed })
       window.scrollTo({ top: 0 })
     } catch {
       setError('네트워크 오류로 제출하지 못했습니다. 연결을 확인한 뒤 다시 시도해 주세요.')
@@ -245,16 +263,14 @@ function SignForm({ data, base, onDone }: { data: SignViewResponse; base: string
       {data.fields
         .filter((f) => f.page === page)
         .map((f) => {
-          const style: React.CSSProperties = {
+          const style: Box = {
             left: f.x * size.width,
             top: f.y * size.height,
             width: f.w * size.width,
             height: f.h * size.height,
           }
-          if (!f.mine) {
-            return <div key={f.id} aria-hidden className="absolute rounded-[2px] border border-dashed border-neutral-300 bg-neutral-400/10" style={style} />
-          }
-          const flash = flashId === f.id ? 'ring-4 ring-[var(--accent)]/40' : ''
+          if (!f.mine) return <OtherField key={f.id} f={f} style={style} />
+          const flash = flashId === f.id || editingId === f.id ? 'ring-4 ring-[var(--accent)]/40' : ''
           const done = isDone(f)
           const boxCls = `absolute rounded-[2px] border-2 transition-shadow ${
             done ? 'border-[var(--accent)]/50 bg-[var(--accent)]/5' : 'border-[var(--accent)] bg-[var(--accent)]/15'
@@ -284,23 +300,22 @@ function SignForm({ data, base, onDone }: { data: SignViewResponse; base: string
               </button>
             )
           }
-          const h = f.h * size.height
-          const label = f.label || (f.type === 'name' ? '이름' : f.type === 'date' ? '날짜' : '텍스트')
+          // Small boxes are not edited in place: tapping opens the bottom-sheet editor with a full-size input.
+          const label = fieldLabel(f)
+          const v = values[f.id] ?? ''
           return (
-            <input
+            <button
               key={f.id}
               id={`field-${f.id}`}
-              type="text"
-              value={values[f.id] ?? ''}
-              onChange={(e) => setValues((v) => ({ ...v, [f.id]: e.target.value }))}
-              placeholder={label}
-              aria-label={label}
-              maxLength={500}
-              inputMode={f.type === 'date' ? 'numeric' : undefined}
-              autoComplete={f.type === 'name' ? 'name' : 'off'}
-              className={`${boxCls} px-1 text-[var(--fg)] outline-none placeholder:text-[var(--accent)]/60 focus:border-[var(--accent)] focus:bg-white`}
-              style={{ ...style, fontSize: Math.max(8, Math.min(h * 0.62, 32)), lineHeight: 1 }}
-            />
+              type="button"
+              onClick={() => openEditor(f.id)}
+              aria-label={`${label} 입력${v ? `: ${v}` : ''}`}
+              aria-haspopup="dialog"
+              className={`${boxCls} block overflow-hidden px-1 text-left outline-none focus-visible:ring-4 focus-visible:ring-[var(--accent)]/40`}
+              style={style}
+            >
+              <FitText text={v || label} boxHeight={f.h * size.height} className={v ? 'text-[var(--fg)]' : 'text-[var(--accent)]/60'} />
+            </button>
           )
         })}
     </>
@@ -352,6 +367,21 @@ function SignForm({ data, base, onDone }: { data: SignViewResponse; base: string
         </div>
       </div>
 
+      {editingId && (
+        <FieldSheet
+          fields={textFields}
+          activeId={editingId}
+          values={values}
+          onChange={(id, v) => setValues((prev) => ({ ...prev, [id]: v }))}
+          onNavigate={openEditor}
+          onClose={() => {
+            const id = editingId
+            setEditingId(null)
+            document.getElementById(`field-${id}`)?.focus({ preventScroll: true })
+          }}
+        />
+      )}
+
       {padOpen && (
         <Modal title="서명 입력" onClose={() => setPadOpen(false)}>
           <SignaturePad
@@ -374,16 +404,194 @@ function ReadonlyOverlay({ fields, page, size }: { fields: SignField[]; page: nu
     <>
       {fields
         .filter((f) => f.page === page)
-        .map((f) => (
-          <div
-            key={f.id}
-            aria-hidden
-            className={`absolute rounded-[2px] border border-dashed ${
-              f.mine ? 'border-[var(--accent)]/60 bg-[var(--accent)]/10' : 'border-neutral-300 bg-neutral-400/10'
-            }`}
-            style={{ left: f.x * size.width, top: f.y * size.height, width: f.w * size.width, height: f.h * size.height }}
+        .map((f) => {
+          const style = { left: f.x * size.width, top: f.y * size.height, width: f.w * size.width, height: f.h * size.height }
+          if (!f.mine || f.signed) return <OtherField key={f.id} f={f} style={style} />
+          return (
+            <div
+              key={f.id}
+              aria-hidden
+              className="absolute rounded-[2px] border border-dashed border-[var(--accent)]/60 bg-[var(--accent)]/10"
+              style={style}
+            />
+          )
+        })}
+    </>
+  )
+}
+
+function fieldLabel(f: SignField): string {
+  return f.label || (f.type === 'name' ? '이름' : f.type === 'date' ? '날짜' : '텍스트')
+}
+
+type Box = { left: number; top: number; width: number; height: number }
+
+// A field that is not ours to fill. Once its signer has signed, show what they entered.
+function OtherField({ f, style }: { f: SignField; style: Box }) {
+  if (!f.signed) {
+    return <div aria-hidden className="absolute rounded-[2px] border border-dashed border-neutral-300 bg-neutral-400/10" style={style} />
+  }
+  const cls = 'absolute overflow-hidden rounded-[2px] border border-emerald-600/40 bg-emerald-50/40'
+  if (f.type === 'signature') {
+    return (
+      <div className={cls} style={style} title="서명 완료">
+        {f.signature_png ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={f.signature_png} alt="서명 완료된 서명" className="h-full w-full object-contain" draggable={false} />
+        ) : (
+          <span className="sr-only">서명 완료</span>
+        )}
+      </div>
+    )
+  }
+  return (
+    <div className={`${cls} px-1`} style={style} title="서명 완료">
+      <FitText text={f.value ?? ''} boxHeight={style.height} className="text-[var(--fg)]" />
+    </div>
+  )
+}
+
+// Single-line text that shrinks its font until it fits the parent box: no ellipsis, no horizontal scroll.
+function FitText({ text, boxHeight, className = '' }: { text: string; boxHeight: number; className?: string }) {
+  const ref = useRef<HTMLSpanElement>(null)
+  const base = Math.max(6, Math.min(boxHeight * 0.62, 32))
+  const [size, setSize] = useState(base)
+  useLayoutEffect(() => {
+    const el = ref.current
+    const box = el?.parentElement
+    if (!el || !box) return
+    el.style.fontSize = `${base}px`
+    const cs = getComputedStyle(box)
+    const avail = box.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight)
+    const need = el.scrollWidth
+    const fitted = need > avail && need > 0 ? Math.max(1, Math.floor(((base * avail) / need) * 10) / 10) : base
+    el.style.fontSize = `${fitted}px`
+    setSize(fitted)
+  }, [text, base])
+  return (
+    <span ref={ref} className={`flex h-full w-max items-center whitespace-nowrap ${className}`} style={{ fontSize: size, lineHeight: 1 }}>
+      {text}
+    </span>
+  )
+}
+
+// Bottom-sheet editor for text/name/date fields: full-size input (16px, 48px tall) with previous/next navigation.
+function FieldSheet({
+  fields,
+  activeId,
+  values,
+  onChange,
+  onNavigate,
+  onClose,
+}: {
+  fields: SignField[]
+  activeId: string
+  values: Record<string, string>
+  onChange: (id: string, value: string) => void
+  onNavigate: (id: string) => void
+  onClose: () => void
+}) {
+  const idx = Math.max(0, fields.findIndex((f) => f.id === activeId))
+  const f = fields[idx]
+  const prev = fields[idx - 1]
+  const next = fields[idx + 1]
+  const inputRef = useRef<HTMLInputElement>(null)
+  const closeRef = useRef(onClose)
+  closeRef.current = onClose
+  // Keep the sheet above the on-screen keyboard (iOS does not shrink the layout viewport).
+  const [kb, setKb] = useState(0)
+  useEffect(() => {
+    const vv = window.visualViewport
+    if (!vv) return
+    const update = () => setKb(Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop)))
+    update()
+    vv.addEventListener('resize', update)
+    vv.addEventListener('scroll', update)
+    return () => {
+      vv.removeEventListener('resize', update)
+      vv.removeEventListener('scroll', update)
+    }
+  }, [])
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closeRef.current()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [])
+  useEffect(() => {
+    const el = inputRef.current
+    if (!el) return
+    el.focus({ preventScroll: true })
+    const end = el.value.length
+    el.setSelectionRange(end, end)
+  }, [activeId])
+  if (!f) return null
+  const label = fieldLabel(f)
+  const navBtn =
+    'inline-flex min-h-12 min-w-[4.5rem] items-center justify-center rounded-md border border-[var(--line)] bg-white px-3 text-sm font-medium text-[var(--fg)] hover:bg-neutral-50 disabled:opacity-40'
+  return (
+    <>
+      <div className="fixed inset-0 z-40 bg-black/15" aria-hidden onClick={onClose} />
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="field-sheet-title"
+        className="fixed inset-x-0 z-50 border-t border-[var(--line)] bg-white shadow-[0_-4px_24px_rgba(0,0,0,0.12)] sm:mx-auto sm:mb-4 sm:max-w-xl sm:rounded-xl sm:border"
+        style={{ bottom: kb }}
+      >
+        <form
+          className="flex flex-col gap-3 px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
+          onSubmit={(e) => {
+            e.preventDefault()
+            if (next) onNavigate(next.id)
+            else onClose()
+          }}
+        >
+          <div className="flex items-center justify-between">
+            <label id="field-sheet-title" htmlFor="field-sheet-input" className="text-sm font-semibold">
+              {label}
+              <span className="ml-2 text-xs font-normal text-[var(--muted)] tabular-nums">
+                {idx + 1}/{fields.length}
+              </span>
+            </label>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="닫기"
+              className="-mr-2 inline-flex h-11 w-11 items-center justify-center rounded-md text-[var(--muted)] hover:bg-neutral-100"
+            >
+              <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden>
+                <path d="M4 4l10 10M14 4L4 14" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+              </svg>
+            </button>
+          </div>
+          <input
+            ref={inputRef}
+            id="field-sheet-input"
+            type="text"
+            value={values[f.id] ?? ''}
+            onChange={(e) => onChange(f.id, e.target.value)}
+            placeholder={f.type === 'date' ? 'YYYY-MM-DD' : label}
+            maxLength={500}
+            inputMode={f.type === 'date' ? 'numeric' : undefined}
+            autoComplete={f.type === 'name' ? 'name' : 'off'}
+            enterKeyHint={next ? 'next' : 'done'}
+            className="min-h-12 w-full rounded-md border border-[var(--line)] bg-white px-3 text-[16px] text-[var(--fg)] outline-none focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]/30"
           />
-        ))}
+          <div className="flex items-center gap-2">
+            <button type="button" className={navBtn} disabled={!prev} onClick={() => prev && onNavigate(prev.id)}>
+              이전
+            </button>
+            <button type="button" className={navBtn} disabled={!next} onClick={() => next && onNavigate(next.id)}>
+              다음
+            </button>
+            <button type="button" className={`${primaryBtn} ml-auto`} onClick={onClose}>
+              완료
+            </button>
+          </div>
+        </form>
+      </div>
     </>
   )
 }
@@ -416,11 +624,11 @@ function DocHeader({ data }: { data: SignViewResponse }) {
         </div>
         <div className="flex gap-1.5">
           <dt className="text-[var(--muted)]">문서 상태</dt>
-          <dd className="font-medium">{DOC_STATUS[doc.status]}</dd>
+          <dd className="font-medium">{DOC_STATUS_LABEL[doc.status]}</dd>
         </div>
         <div className="flex gap-1.5">
           <dt className="text-[var(--muted)]">내 상태</dt>
-          <dd className="font-medium">{SIGNER_STATUS[signer.status]}</dd>
+          <dd className="font-medium">{SIGNER_STATUS_LABEL[signer.status]}</dd>
         </div>
         <div className="flex gap-1.5">
           <dt className="text-[var(--muted)]">진행</dt>

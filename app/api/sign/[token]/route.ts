@@ -41,8 +41,12 @@ export async function GET(req: Request, ctx: Ctx) {
   }
 
   const { bundle, signer, canSign, reason } = view
+  // Signers who already signed: their field values and signature image are shown to later signers.
+  // Never include tokens, emails or anything from signers who have not signed yet.
+  const signedSigners = new Map(bundle.signers.filter((s) => s.status === 'signed').map((s) => [s.id, s.signature_png]))
   const fields: SignField[] = bundle.fields.map((f) => {
     const mine = f.signer_id === signer.id
+    const signed = signedSigners.has(f.signer_id)
     return {
       id: f.id,
       page: f.page,
@@ -53,7 +57,9 @@ export async function GET(req: Request, ctx: Ctx) {
       type: f.type,
       label: mine ? f.label : null,
       mine,
-      value: mine ? f.value : null,
+      value: mine || signed ? f.value : null,
+      signed,
+      signature_png: signed && f.type === 'signature' ? (signedSigners.get(f.signer_id) ?? null) : null,
     }
   })
   const d = bundle.document

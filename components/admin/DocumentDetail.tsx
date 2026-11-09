@@ -3,11 +3,23 @@
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import type { DocumentBundle, EventType, SignerRow } from '@/lib/types'
+import type { DocumentBundle, EventRow, EventType, SignerRow } from '@/lib/types'
 import StatusBadge from './StatusBadge'
-import { SIGNER_STATUS, fmtDateTime, signerColor } from './format'
+import { fmtDateTime, signerColor, signerStatusLabel } from './format'
 
 type Notified = { signerId: string; link: string; emailed: boolean }
+type NotifiedKind = 'request' | 'completed'
+
+// Signer ids whose most recent email attempt failed (an email_failed newer than their last email_sent).
+function failedEmailSigners(events: EventRow[]): Set<string> {
+  const last = new Map<string, { type: EventType; at: string; idx: number }>()
+  events.forEach((e, idx) => {
+    if (!e.signer_id || (e.type !== 'email_sent' && e.type !== 'email_failed')) return
+    const prev = last.get(e.signer_id)
+    if (!prev || e.at > prev.at || (e.at === prev.at && idx > prev.idx)) last.set(e.signer_id, { type: e.type, at: e.at, idx })
+  })
+  return new Set([...last].filter(([, v]) => v.type === 'email_failed').map(([id]) => id))
+}
 
 const EVENT_LABEL: Record<EventType, string> = {
   created: '문서 생성',
@@ -42,7 +54,17 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
-function CopyButton({ text, label = '링크 복사', className = '' }: { text: string; label?: string; className?: string }) {
+function CopyButton({
+  text,
+  label = '링크 복사',
+  className = '',
+  highlight = false,
+}: {
+  text: string
+  label?: string
+  className?: string
+  highlight?: boolean
+}) {
   const [state, setState] = useState<'idle' | 'ok' | 'fail'>('idle')
   return (
     <button
@@ -51,7 +73,11 @@ function CopyButton({ text, label = '링크 복사', className = '' }: { text: s
         setState((await copyText(text)) ? 'ok' : 'fail')
         setTimeout(() => setState('idle'), 1800)
       }}
-      className={`rounded-md border border-[var(--line)] bg-white px-2.5 py-1 text-xs font-medium whitespace-nowrap hover:bg-neutral-50 ${className}`}
+      className={`rounded-md border px-2.5 py-1 text-xs font-medium whitespace-nowrap ${
+        highlight
+          ? 'border-amber-400 bg-amber-100 text-amber-900 ring-2 ring-amber-300 hover:bg-amber-200'
+          : 'border-[var(--line)] bg-white hover:bg-neutral-50'
+      } ${className}`}
     >
       <span aria-live="polite">{state === 'ok' ? '복사됨' : state === 'fail' ? '복사 실패' : label}</span>
     </button>
@@ -62,6 +88,7 @@ export default function DocumentDetail({ bundle, links }: { bundle: DocumentBund
   const router = useRouter()
   const { document: doc, signers, events } = bundle
   const [notified, setNotified] = useState<Notified[] | null>(null)
+  const [notifiedKind, setNotifiedKind] = useState<NotifiedKind>('request')
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -73,7 +100,10 @@ export default function DocumentDetail({ bundle, links }: { bundle: DocumentBund
       if (raw) {
         sessionStorage.removeItem(key)
         const v = JSON.parse(raw) as unknown
-        if (Array.isArray(v)) setNotified(v as Notified[])
+        if (Array.isArray(v)) {
+          setNotifiedKind('request')
+          setNotified(v as Notified[])
+        }
       }
     } catch {}
   }, [doc.id])
@@ -86,11 +116,28 @@ export default function DocumentDetail({ bundle, links }: { bundle: DocumentBund
     owner.status !== 'signed' &&
     signers.every((s) => s.order_index >= owner.order_index || s.status === 'signed')
   const signedCount = signers.filter((s) => s.status === 'signed').length
+  // Everyone signed but the document never reached `completed`: sealing failed. Resend retries it server-side.
+  const sealFailed = doc.status === 'sent' && signers.length > 0 && signedCount === signers.length
+  const emailFailed = failedEmailSigners(events)
+  const canDelete = doc.status !== 'sent'
 
   async function call(action: 'resend' | 'void' | 'delete') {
     setError(null)
     if (action === 'void' && !window.confirm('이 문서를 무효 처리할까요? 더 이상 서명할 수 없게 됩니다.')) return
-    if (action === 'delete' && !window.confirm('이 문서와 모든 서명 기록을 삭제할까요? 되돌릴 수 없습니다.')) return
+    if (action === 'delete') {
+      if (!canDelete) return
+      if (doc.status === 'completed') {
+        const typed = window.prompt(
+          '서명이 완료된 문서입니다. 삭제하면 날인본과 모든 서명 기록이 영구히 사라집니다.\n계속하려면 "삭제"를 입력하세요.',
+        )
+        if (typed === null) return
+        if (typed.trim() !== '삭제') {
+          setError('입력이 일치하지 않아 삭제하지 않았습니다.')
+          return
+        }
+      } else if (!window.confirm('이 문서와 모든 서명 기록을 삭제할까요? 되돌릴 수 없습니다.')) return
+    }
+    if (action === 'resend' && doc.status === 'completed' && !window.confirm('모든 서명자에게 완료본 이메일을 다시 보낼까요?')) return
     setBusy(action)
     try {
       const res =
@@ -101,7 +148,11 @@ export default function DocumentDetail({ bundle, links }: { bundle: DocumentBund
         window.location.assign(`/login?next=/admin/documents/${doc.id}`)
         return
       }
-      const data = (await res.json().catch(() => null)) as { error?: string; notified?: Notified | null } | null
+      const data = (await res.json().catch(() => null)) as {
+        error?: string
+        notified?: Notified | Notified[] | null
+        notifiedAll?: Notified[]
+      } | null
       if (!res.ok) throw new Error(data?.error ?? '요청을 처리하지 못했습니다.')
       if (action === 'delete') {
         router.push('/admin')
@@ -109,8 +160,13 @@ export default function DocumentDetail({ bundle, links }: { bundle: DocumentBund
         return
       }
       if (action === 'resend') {
-        if (data?.notified) setNotified([data.notified])
-        else setError('알림을 보낼 서명자가 없습니다.')
+        // Completed docs: server re-sends to every signer and returns them in notifiedAll.
+        const n = data?.notified
+        const list = data?.notifiedAll?.length ? data.notifiedAll : Array.isArray(n) ? n : n ? [n] : []
+        if (list.length > 0) {
+          setNotifiedKind(doc.status === 'completed' ? 'completed' : 'request')
+          setNotified(list)
+        } else if (!sealFailed) setError('알림을 보낼 서명자가 없습니다.')
       }
       router.refresh()
     } catch (e) {
@@ -193,25 +249,57 @@ export default function DocumentDetail({ bundle, links }: { bundle: DocumentBund
         <a href={`/api/admin/documents/${doc.id}/file?kind=original&download=1`} className={btn}>
           원본 다운로드
         </a>
+        {doc.status === 'completed' && (
+          <button type="button" className={btn} disabled={busy !== null} onClick={() => call('resend')}>
+            {busy === 'resend' ? '보내는 중...' : '완료본 다시 보내기'}
+          </button>
+        )}
         {doc.status === 'sent' && (
           <>
-            <button type="button" className={btn} disabled={busy !== null} onClick={() => call('resend')}>
-              {busy === 'resend' ? '보내는 중...' : '알림 재발송'}
-            </button>
+            {!sealFailed && (
+              <button type="button" className={btn} disabled={busy !== null} onClick={() => call('resend')}>
+                {busy === 'resend' ? '보내는 중...' : '알림 재발송'}
+              </button>
+            )}
             <button type="button" className={btn} disabled={busy !== null} onClick={() => call('void')}>
               {busy === 'void' ? '처리 중...' : '무효 처리'}
             </button>
           </>
         )}
-        <button
-          type="button"
-          disabled={busy !== null}
-          onClick={() => call('delete')}
-          className="rounded-md border border-red-200 bg-white px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
-        >
-          {busy === 'delete' ? '삭제 중...' : '삭제'}
-        </button>
+        <span className="inline-flex items-center gap-2">
+          <button
+            type="button"
+            disabled={busy !== null || !canDelete}
+            onClick={() => call('delete')}
+            aria-describedby={canDelete ? undefined : 'delete-hint'}
+            title={canDelete ? undefined : '서명 진행 중인 문서는 먼저 무효 처리하세요'}
+            className="rounded-md border border-red-200 bg-white px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-white"
+          >
+            {busy === 'delete' ? '삭제 중...' : '삭제'}
+          </button>
+          {!canDelete && (
+            <span id="delete-hint" className="text-xs text-[var(--muted)]">
+              먼저 무효 처리하세요
+            </span>
+          )}
+        </span>
       </div>
+
+      {sealFailed && (
+        <div role="alert" className="flex flex-col gap-2 rounded-md border border-red-300 bg-red-50 px-4 py-3 sm:flex-row sm:items-center">
+          <p className="flex-1 text-sm text-red-800">
+            <span className="font-semibold">날인본 생성 실패</span> — 모든 서명이 끝났지만 최종 PDF를 만들지 못했습니다.
+          </p>
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={() => call('resend')}
+            className="self-start rounded-md bg-red-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-800 disabled:opacity-50 sm:self-auto"
+          >
+            {busy === 'resend' ? '다시 시도하는 중...' : '다시 시도'}
+          </button>
+        </div>
+      )}
 
       {error && (
         <p role="alert" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
@@ -220,7 +308,7 @@ export default function DocumentDetail({ bundle, links }: { bundle: DocumentBund
       )}
 
       {notified && (
-        <NotifiedPanel notified={notified} byId={byId} onClose={() => setNotified(null)} />
+        <NotifiedPanel notified={notified} kind={notifiedKind} byId={byId} onClose={() => setNotified(null)} />
       )}
 
       {/* Signers */}
@@ -233,7 +321,14 @@ export default function DocumentDetail({ bundle, links }: { bundle: DocumentBund
         ) : (
           <ol className="divide-y divide-[var(--line)]">
             {signers.map((s, i) => (
-              <SignerItem key={s.id} s={s} i={i} link={links[s.id]} showLink={doc.status === 'sent' && s.status !== 'signed'} />
+              <SignerItem
+                key={s.id}
+                s={s}
+                i={i}
+                link={links[s.id]}
+                showLink={doc.status === 'sent' && s.status !== 'signed'}
+                emailFailed={doc.status === 'sent' && s.status !== 'signed' && emailFailed.has(s.id)}
+              />
             ))}
           </ol>
         )}
@@ -294,11 +389,23 @@ export default function DocumentDetail({ bundle, links }: { bundle: DocumentBund
   )
 }
 
-function SignerItem({ s, i, link, showLink }: { s: SignerRow; i: number; link?: string; showLink: boolean }) {
+function SignerItem({
+  s,
+  i,
+  link,
+  showLink,
+  emailFailed,
+}: {
+  s: SignerRow
+  i: number
+  link?: string
+  showLink: boolean
+  emailFailed: boolean
+}) {
   const tone =
     s.status === 'signed' ? 'text-emerald-700' : s.status === 'viewed' ? 'text-amber-700' : 'text-[var(--muted)]'
   return (
-    <li className="flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center">
+    <li className={`flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center ${emailFailed ? 'bg-amber-50/60' : ''}`}>
       <div className="flex min-w-0 flex-1 items-start gap-3">
         <span
           className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs font-semibold text-white"
@@ -316,23 +423,36 @@ function SignerItem({ s, i, link, showLink }: { s: SignerRow; i: number; link?: 
           </p>
           <p className="truncate text-xs text-[var(--muted)]">{s.email}</p>
           <p className="mt-0.5 text-xs tabular-nums">
-            <span className={tone}>{SIGNER_STATUS[s.status]}</span>
+            <span className={tone}>{signerStatusLabel(s.status, s.is_owner)}</span>
             {s.signed_at && <span className="text-[var(--muted)]"> · {fmtDateTime(s.signed_at)}</span>}
             {s.ip && <span className="text-[var(--muted)]"> · IP {s.ip}</span>}
           </p>
+          {emailFailed && (
+            <p role="status" className="mt-1 text-xs font-medium text-amber-800">
+              메일 발송 실패 — 링크를 직접 전달하세요
+            </p>
+          )}
         </div>
       </div>
-      {showLink && link && <CopyButton text={link} className="self-start sm:self-center" />}
+      {showLink && link && (
+        <CopyButton
+          text={link}
+          highlight={emailFailed}
+          className="self-start sm:self-center"
+        />
+      )}
     </li>
   )
 }
 
 function NotifiedPanel({
   notified,
+  kind,
   byId,
   onClose,
 }: {
   notified: Notified[]
+  kind: NotifiedKind
   byId: Map<string, SignerRow>
   onClose: () => void
 }) {
@@ -353,10 +473,21 @@ function NotifiedPanel({
           {notified.map((n) => {
             const s = byId.get(n.signerId)
             const name = s?.name ?? '서명자'
+            if (kind === 'completed') {
+              return n.emailed ? (
+                <li key={n.signerId} className="text-sm">
+                  {name}님({s?.email})에게 완료본을 이메일로 보냈습니다.
+                </li>
+              ) : (
+                <li key={n.signerId} className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm font-medium text-amber-900">
+                  {name}님에게 완료본 이메일을 보내지 못했습니다.
+                </li>
+              )
+            }
             if (s?.is_owner === 1) {
               return (
                 <li key={n.signerId} className="text-sm">
-                  지금은 본인(나) 차례입니다.{' '}
+                  지금은 본인(나) 차례입니다{n.emailed ? ' (알림 이메일도 보냈습니다)' : ''}.{' '}
                   <a href={new URL(n.link, 'http://x').pathname} className="font-medium text-[var(--accent)] underline">
                     지금 서명하기
                   </a>

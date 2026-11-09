@@ -1,4 +1,4 @@
-<#
+﻿<#
   Start pdf-esign with a public Cloudflare quick tunnel.
 
   Usage (from the repo root):
@@ -7,7 +7,12 @@
     powershell -ExecutionPolicy Bypass -File scripts/start.ps1 -NoTunnel  # local only
 
   The quick tunnel URL changes every run. The script passes it to the app as APP_URL,
-  so links in emails always point to the current tunnel. Process env overrides .env.local.
+  so links in NEW emails point to the current tunnel; links in emails sent before a restart break
+  (use "알림 재발송" in the admin page, or a named tunnel with your own domain, see README).
+  Process env overrides .env.local.
+
+  The server binds to 127.0.0.1 only. With the tunnel on, TRUST_PROXY=cloudflare is set so the
+  client IP is read from cf-connecting-ip (safe because nothing else can reach the port).
   Keep this window open while the other party signs. Ctrl+C stops both.
 #>
 param(
@@ -31,7 +36,7 @@ if (-not $NoTunnel) {
   $log = Join-Path $env:TEMP "pdf-esign-tunnel-$Port.log"
   if (Test-Path $log) { Remove-Item $log -Force }
   Write-Host "Starting Cloudflare quick tunnel..."
-  $tunnel = Start-Process -FilePath $cfPath -ArgumentList @('tunnel', '--no-autoupdate', '--url', "http://localhost:$Port") `
+  $tunnel = Start-Process -FilePath $cfPath -ArgumentList @('tunnel', '--no-autoupdate', '--url', "http://127.0.0.1:$Port") `
     -RedirectStandardError $log -WindowStyle Hidden -PassThru
 
   $url = $null
@@ -44,18 +49,20 @@ if (-not $NoTunnel) {
   }
   if (-not $url) { Stop-Process -Id $tunnel.Id -Force; throw "Tunnel URL not found. See $log" }
   $env:APP_URL = $url
+  $env:TRUST_PROXY = 'cloudflare'
   Write-Host ""
   Write-Host "Public URL : $url" -ForegroundColor Green
-  Write-Host "Admin      : $url/admin  (local: http://localhost:$Port/admin)" -ForegroundColor Green
+  Write-Host "Admin      : $url/admin  (local: http://127.0.0.1:$Port/admin)" -ForegroundColor Green
+  Write-Host "Note       : this quick-tunnel URL changes on every restart; links in emails sent earlier will stop working." -ForegroundColor Yellow
   Write-Host ""
 }
 
 try {
   if ($Dev) {
-    npx next dev -p $Port
+    npx next dev -H 127.0.0.1 -p $Port
   } else {
     if (-not (Test-Path '.next/BUILD_ID')) { npm run build }
-    npx next start -p $Port
+    npx next start -H 127.0.0.1 -p $Port
   }
 } finally {
   if ($tunnel -and -not $tunnel.HasExited) { Stop-Process -Id $tunnel.Id -Force }

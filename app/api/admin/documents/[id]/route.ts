@@ -1,4 +1,4 @@
-import { isAdmin } from '@/lib/auth'
+import { adminGuard, isAdmin } from '@/lib/auth'
 import { getBundle, getDocument } from '@/lib/db'
 import type { FieldType } from '@/lib/types'
 import { deleteDocument, saveDraft } from '@/lib/workflow'
@@ -102,7 +102,8 @@ function parseDraft(body: unknown, pageCount: number): DraftInput | string {
 }
 
 export async function PUT(req: Request, { params }: Ctx) {
-  if (!(await isAdmin())) return unauthorized()
+  const denied = await adminGuard(req)
+  if (denied) return denied
   const { id } = await params
   let body: unknown
   try {
@@ -122,8 +123,9 @@ export async function PUT(req: Request, { params }: Ctx) {
   }
 }
 
-export async function DELETE(_req: Request, { params }: Ctx) {
-  if (!(await isAdmin())) return unauthorized()
+export async function DELETE(req: Request, { params }: Ctx) {
+  const denied = await adminGuard(req)
+  if (denied) return denied
   const { id } = await params
   try {
     deleteDocument(id)

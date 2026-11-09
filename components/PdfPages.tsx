@@ -111,7 +111,7 @@ export default function PdfPages({ url, maxWidth = 900, renderOverlay, onLoaded 
             return (
               <figure key={i} className="m-0 flex flex-col items-center gap-2" aria-label={`${i + 1}페이지`}>
                 <div className="relative bg-white shadow-[0_1px_3px_rgba(0,0,0,0.12)] ring-1 ring-[var(--line)]" style={{ width: w, height: h }}>
-                  <PageCanvas page={p} width={w} height={h} />
+                  <LazyPageCanvas page={p} width={w} height={h} />
                   {renderOverlay && (
                     <div className="absolute inset-0" style={{ width: w, height: h }}>
                       {renderOverlay(i + 1, { width: w, height: h })}
@@ -130,6 +130,34 @@ export default function PdfPages({ url, maxWidth = 900, renderOverlay, onLoaded 
   )
 }
 
+// Placeholder keeps the page's exact size (so overlays and scroll positions are stable); the canvas is only
+// rendered while the page is within ~1 viewport, and released again once it is ~3 viewports away.
+function LazyPageCanvas({ page, width, height }: { page: PageInfo; width: number; height: number }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [active, setActive] = useState(false)
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    if (typeof IntersectionObserver === 'undefined') {
+      setActive(true)
+      return
+    }
+    const near = new IntersectionObserver((es) => es.some((e) => e.isIntersecting) && setActive(true), { rootMargin: '100% 0px' })
+    const far = new IntersectionObserver((es) => es.every((e) => !e.isIntersecting) && setActive(false), { rootMargin: '300% 0px' })
+    near.observe(el)
+    far.observe(el)
+    return () => {
+      near.disconnect()
+      far.disconnect()
+    }
+  }, [])
+  return (
+    <div ref={ref} className="absolute inset-0">
+      {active ? <PageCanvas page={page} width={width} height={height} /> : <div className="absolute inset-0 bg-neutral-100/60" aria-hidden />}
+    </div>
+  )
+}
+
 function PageCanvas({ page, width, height }: { page: PageInfo; width: number; height: number }) {
   const ref = useRef<HTMLCanvasElement>(null)
   const [rendering, setRendering] = useState(true)
@@ -137,7 +165,7 @@ function PageCanvas({ page, width, height }: { page: PageInfo; width: number; he
   useEffect(() => {
     const canvas = ref.current
     if (!canvas) return
-    const dpr = Math.min(window.devicePixelRatio || 1, 3)
+    const dpr = Math.min(window.devicePixelRatio || 1, 2)
     const scale = (width / page.baseWidth) * dpr
     const viewport = page.proxy.getViewport({ scale })
     canvas.width = Math.floor(viewport.width)

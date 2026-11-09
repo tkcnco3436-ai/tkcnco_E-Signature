@@ -1,4 +1,7 @@
-import type { DocumentStatus, SignerStatus } from '@/lib/types'
+import type { DocumentStatus } from '@/lib/types'
+import { DOC_STATUS_LABEL } from '@/components/labels'
+
+export { SIGNER_STATUS_LABEL, signerStatusLabel } from '@/components/labels'
 
 const kst = new Intl.DateTimeFormat('ko-KR', {
   timeZone: 'Asia/Seoul',
@@ -24,17 +27,10 @@ export function fmtDate(iso: string | null | undefined): string {
 }
 
 export const DOC_STATUS: Record<DocumentStatus, { label: string; cls: string }> = {
-  draft: { label: '작성중', cls: 'bg-neutral-100 text-neutral-700 ring-neutral-300' },
-  sent: { label: '서명진행중', cls: 'bg-amber-50 text-amber-800 ring-amber-300' },
-  completed: { label: '완료', cls: 'bg-emerald-50 text-emerald-800 ring-emerald-300' },
-  voided: { label: '무효', cls: 'bg-red-50 text-red-700 ring-red-200' },
-}
-
-export const SIGNER_STATUS: Record<SignerStatus, string> = {
-  pending: '대기',
-  sent: '알림 발송됨',
-  viewed: '열람함',
-  signed: '서명 완료',
+  draft: { label: DOC_STATUS_LABEL.draft, cls: 'bg-neutral-100 text-neutral-700 ring-neutral-300' },
+  sent: { label: DOC_STATUS_LABEL.sent, cls: 'bg-amber-50 text-amber-800 ring-amber-300' },
+  completed: { label: DOC_STATUS_LABEL.completed, cls: 'bg-emerald-50 text-emerald-800 ring-emerald-300' },
+  voided: { label: DOC_STATUS_LABEL.voided, cls: 'bg-red-50 text-red-700 ring-red-200' },
 }
 
 // Distinct, readable colors for signers (index = signing order).

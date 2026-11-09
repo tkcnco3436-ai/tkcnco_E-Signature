@@ -13,6 +13,8 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'esign-smoke-'))
 process.env.DATA_DIR = dataDir
 process.env.APP_URL = 'https://esign.example.test'
 delete process.env.RESEND_API_KEY
+process.env.MAIL_DISABLED = '1' // never send real mail from tests
+delete process.env.TRUST_PROXY
 
 const { PDFDocument, StandardFonts, degrees, decodePDFRawStream, PDFRawStream, PDFName, PDFDict } = await import('pdf-lib')
 const forge = (await import('node-forge')).default
@@ -60,10 +62,8 @@ function chunk(type: string, data: Buffer): Buffer {
   crc.writeUInt32BE(crc32(td))
   return Buffer.concat([len, td, crc])
 }
-/** 300x100 RGBA PNG with a blue scribble on a transparent background. */
-function signaturePng(): string {
-  const W = 300
-  const H = 100
+/** WxH RGBA PNG with a blue scribble on a transparent background (default 300x100). */
+function signaturePng(W = 300, H = 100, corruptIdat = false): string {
   const px = Buffer.alloc(W * H * 4)
   for (let x = 10; x < W - 10; x++) {
     const y = Math.round(50 + 30 * Math.sin(x / 18) * Math.cos(x / 47))
@@ -85,7 +85,7 @@ function signaturePng(): string {
   const png = Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     chunk('IHDR', ihdr),
-    chunk('IDAT', zlib.deflateSync(raw)),
+    chunk('IDAT', corruptIdat ? crypto.randomBytes(400) : zlib.deflateSync(raw)),
     chunk('IEND', Buffer.alloc(0)),
   ])
   return 'data:image/png;base64,' + png.toString('base64')
@@ -249,6 +249,13 @@ await expectWorkflowError(
   wf.submitSignature(owner.token, { signaturePng: sig, values: {}, consent: false as unknown as true }, info),
 )
 log('submitSignature rejects bad PNG / missing consent')
+assert.match(
+  (await expectWorkflowError(wf.submitSignature(owner.token, { signaturePng: signaturePng(3200, 100), values: {}, consent: true }, info), 400))!,
+  /크기/,
+)
+await expectWorkflowError(wf.submitSignature(owner.token, { signaturePng: signaturePng(300, 100, true), values: {}, consent: true }, info), 400)
+assert.equal(dbm.getSigners(doc.id).find((s) => s.id === owner.id)!.status, 'viewed')
+log('submitSignature rejects oversized (3200x100) and undecodable PNGs before saving')
 
 const r1 = await wf.submitSignature(owner.token, { signaturePng: sig, values: {}, consent: true }, info)
 assert.equal(r1.completed, false)
@@ -271,6 +278,7 @@ const r2 = await wf.submitSignature(
   { ip: '198.51.100.23', userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1' },
 )
 assert.equal(r2.completed, true)
+await wf.flushBackgroundTasks() // completion emails run in the background
 
 const final = dbm.getBundle(doc.id)!
 assert.equal(final.document.status, 'completed')
@@ -319,14 +327,96 @@ assert.ok(await sess.verifySessionToken(secret, tok))
 assert.ok(!(await sess.verifySessionToken('y'.repeat(40), tok)))
 assert.ok(!(await sess.verifySessionToken(secret, tok.slice(0, -2) + (tok.endsWith('A') ? 'BB' : 'AA'))))
 assert.ok(!(await sess.verifySessionToken(secret, await sess.signSessionToken(secret, Date.now() - 8 * 86400e3))))
-const ci = http.clientInfo(
-  new Request('http://x', { headers: { 'x-forwarded-for': '1.2.3.4, 10.0.0.1', 'user-agent': 'u'.repeat(400) } }),
-)
-assert.equal(ci.ip, '1.2.3.4')
+const pwfA = await sess.passwordFingerprint(secret, 'password-one-123')
+const pwfB = await sess.passwordFingerprint(secret, 'password-two-456')
+assert.match(pwfA, /^[0-9a-f]{16}$/)
+const tokA = await sess.signSessionToken(secret, Date.now(), pwfA)
+assert.ok(await sess.verifySessionToken(secret, tokA, pwfA))
+assert.ok(!(await sess.verifySessionToken(secret, tokA, pwfB)), 'password change must revoke session')
+assert.ok(!(await sess.verifySessionToken(secret, tok, pwfA)), 'token without fingerprint must fail when one is required')
+assert.ok(sess.adminPasswordProblem('short-pw'))
+assert.equal(sess.adminPasswordProblem('long-enough-pw'), null)
+const spoof = { 'x-forwarded-for': '1.2.3.4, 10.0.0.1', 'cf-connecting-ip': '9.9.9.9', 'x-real-ip': '8.8.8.8', 'user-agent': 'u'.repeat(400) }
+const ci = http.clientInfo(new Request('http://x', { headers: spoof }))
+assert.equal(ci.ip, null, 'TRUST_PROXY=none must ignore forwarding headers')
 assert.equal(ci.userAgent?.length, 300)
-assert.equal(http.clientInfo(new Request('http://x', { headers: { 'cf-connecting-ip': '9.9.9.9', 'x-real-ip': '8.8.8.8' } })).ip, '9.9.9.9')
+assert.equal(http.rateKey(new Request('http://x', { headers: spoof })), 'local')
+process.env.TRUST_PROXY = 'cloudflare'
+assert.equal(http.clientInfo(new Request('http://x', { headers: spoof })).ip, '9.9.9.9')
+assert.equal(http.clientInfo(new Request('http://x', { headers: { 'x-forwarded-for': '1.2.3.4' } })).ip, null)
+assert.equal(http.clientInfo(new Request('http://x', { headers: { 'cf-connecting-ip': '<script>' } })).ip, null)
+delete process.env.TRUST_PROXY
+const post = (h: Record<string, string>) => new Request('http://esign.local/api/admin/x', { method: 'POST', headers: h })
+assert.ok(http.csrfOk(post({ host: 'esign.local' })))
+assert.ok(http.csrfOk(post({ host: 'esign.local', origin: 'http://esign.local' })))
+assert.ok(http.csrfOk(post({ host: '127.0.0.1:3100', origin: 'https://esign.example.test' })), 'APP_URL origin allowed')
+assert.ok(!http.csrfOk(post({ host: 'esign.local', origin: 'https://evil.example' })))
+assert.ok(!http.csrfOk(post({ host: 'esign.local', origin: 'null' })))
+assert.ok(http.csrfOk(new Request('http://esign.local/x', { headers: { host: 'esign.local', origin: 'https://evil.example' } })), 'GET not checked')
+assert.deepEqual([1, 2].map(() => http.rateLimit('cnt', 5, 60_000)), [true, true])
+assert.equal(http.rateCount('cnt'), 2)
 assert.deepEqual([1, 2, 3].map(() => http.rateLimit('k', 2, 60_000)), [true, true, false])
-log('session token sign/verify/tamper/expiry, clientInfo, rateLimit')
+log('session token sign/verify/tamper/expiry/password fingerprint, clientInfo/TRUST_PROXY, CSRF origin, rateLimit')
+
+// Crop box: inverted rect normalized and intersected with the media box (pdf.js Page.view rule).
+{
+  const pdfm = await import('../lib/pdf.ts')
+  const d = await PDFDocument.create()
+  const p = d.addPage([600, 800])
+  p.setCropBox(500, 700, -400, -600) // inverted: corners (500,700) and (100,100)
+  assert.deepEqual(pdfm.visibleBox(p), { x: 100, y: 100, width: 400, height: 600 })
+  p.setCropBox(-50, -50, 300, 2000) // sticks out of the media box
+  assert.deepEqual(pdfm.visibleBox(p), { x: 0, y: 0, width: 250, height: 800 })
+  p.setCropBox(1000, 1000, 10, 10) // no overlap -> media box
+  assert.deepEqual(pdfm.visibleBox(p), { x: 0, y: 0, width: 600, height: 800 })
+  log('visibleBox: crop box normalized + intersected with media box')
+}
+
+// Resend on a completed document re-sends the completion mail to every signer.
+const resent = await wf.resendNotification(doc.id)
+assert.equal(resent.length, 2)
+assert.ok(resent.every((n) => n.link.includes('/api/sign/') && n.link.endsWith('/download')))
+assert.ok(dbm.getEvents(doc.id).some((e) => e.detail?.startsWith('완료본 재발송')))
+log('resendNotification(completed) -> completion mail to all signers with fresh download links')
+
+// Owner signing second gets a "your turn" mail (admin link, no token).
+{
+  const d3 = await wf.createDocument({ title: 'owner second', pdf: pdfBytes })
+  const b3 = wf.saveDraft(d3.id, {
+    signers: [
+      { name: '홍길동', email: 'hong@example.com', is_owner: false, order_index: 0 },
+      { name: '김태경', email: 'owner@example.com', is_owner: true, order_index: 1 },
+    ],
+    fields: [
+      { signer_ref: 0, page: 1, x: 0.1, y: 0.1, w: 0.3, h: 0.08, type: 'signature' },
+      { signer_ref: 1, page: 1, x: 0.5, y: 0.1, w: 0.3, h: 0.08, type: 'signature' },
+    ],
+  })
+  await wf.sendDocument(d3.id)
+  await expectWorkflowError(() => wf.deleteDocument(d3.id), 409)
+  log('deleteDocument refuses a sent document (409)')
+  await wf.submitSignature(b3.signers[0].token, { signaturePng: sig, values: {}, consent: true }, info)
+  const ev = dbm.getEvents(d3.id).find((e) => e.detail?.includes('서명 차례 알림(관리자) → owner@example.com'))
+  assert.ok(ev, 'owner turn notification missing')
+  assert.ok(!ev.detail!.includes(b3.signers[1].token))
+  log('owner (2nd) notified by email with admin link')
+  // Concurrent finalize attempts: only one sealing, one completed event.
+  const signing = wf.submitSignature(b3.signers[1].token, { signaturePng: sig, values: {}, consent: true }, info)
+  while (dbm.getSigners(d3.id).some((s) => s.status !== 'signed')) await new Promise((r) => setImmediate(r))
+  assert.ok(wf.isSealing(d3.id), 'seal lock should be held while sealing')
+  await expectWorkflowError(() => wf.deleteDocument(d3.id), 409)
+  const retry = wf.resendNotification(d3.id) // admin retry while the first sealing is running
+  const [r3, again] = await Promise.all([signing, retry])
+  await wf.flushBackgroundTasks()
+  assert.equal(r3.completed, true)
+  assert.deepEqual(again, [])
+  assert.ok(!wf.isSealing(d3.id))
+  assert.equal(dbm.getEvents(d3.id).filter((e) => e.type === 'completed').length, 1)
+  assert.equal(dbm.getDocument(d3.id)!.signed_sha256, dbm.sha256(fs.readFileSync(dbm.signedPdfPath(d3.id))))
+  assert.deepEqual(fs.readdirSync(dbm.docDir(d3.id)).filter((n) => n.endsWith('.tmp')), [])
+  wf.deleteDocument(d3.id) // completed: allowed
+  log('concurrent finalize: single completed event, hash matches file, no temp files; completed doc deletable')
+}
 
 // Void/delete guards
 await expectWorkflowError(() => wf.voidDocument(doc.id), 409)

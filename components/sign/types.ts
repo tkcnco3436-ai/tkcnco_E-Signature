@@ -11,7 +11,12 @@ export interface SignField {
   type: FieldType
   label: string | null
   mine: boolean
-  value: string | null // only for own fields; always null for others
+  // Own fields: current value. Other signers' fields: their submitted value, only once that signer has signed.
+  value: string | null
+  // True when the field's signer has already signed (their value/signature is final).
+  signed: boolean
+  // Signature fields of a signer who has signed: that signer's signature image (data:image/png). Otherwise null.
+  signature_png: string | null
 }
 
 export interface SignViewResponse {

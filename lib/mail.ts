@@ -16,23 +16,46 @@ export interface MailTemplate {
   text: string
 }
 
-/** Sends via Resend when RESEND_API_KEY is set; otherwise logs the message and returns ok:false. */
+function logInsteadOfSending(reason: string, msg: MailMessage): void {
+  const att = msg.attachments?.map((a) => `${a.filename} (${a.content.length} bytes)`).join(', ') || 'none'
+  console.log(
+    `[mail] ${reason}; not sending.\n  to: ${msg.to}\n  subject: ${msg.subject}\n  attachments: ${att}\n${msg.text
+      .split('\n')
+      .map((l) => '  | ' + l)
+      .join('\n')}`,
+  )
+}
+
+/** MAIL_DISABLED=1 (or true) turns off all outgoing mail, e.g. for tests against a real .env.local. */
+export function mailDisabled(): boolean {
+  const v = (process.env.MAIL_DISABLED ?? '').trim().toLowerCase()
+  return v === '1' || v === 'true' || v === 'yes'
+}
+
+/**
+ * Sends via Resend when RESEND_API_KEY and MAIL_FROM are set; otherwise logs the message and returns ok:false.
+ * MAIL_DISABLED=1 always logs instead of sending.
+ */
 export async function sendMail(msg: MailMessage): Promise<{ ok: boolean; error?: string }> {
+  if (mailDisabled()) {
+    logInsteadOfSending('MAIL_DISABLED is set', msg)
+    return { ok: false, error: 'mail disabled' }
+  }
   const key = process.env.RESEND_API_KEY
   if (!key) {
-    const att = msg.attachments?.map((a) => `${a.filename} (${a.content.length} bytes)`).join(', ') || 'none'
-    console.log(
-      `[mail] RESEND_API_KEY not set; not sending.\n  to: ${msg.to}\n  subject: ${msg.subject}\n  attachments: ${att}\n${msg.text
-        .split('\n')
-        .map((l) => '  | ' + l)
-        .join('\n')}`,
-    )
+    logInsteadOfSending('RESEND_API_KEY not set', msg)
     return { ok: false, error: 'no RESEND_API_KEY' }
+  }
+  const from = process.env.MAIL_FROM?.trim()
+  if (!from) {
+    // Never fall back to Resend's shared test sender: it only delivers to the account owner.
+    logInsteadOfSending('MAIL_FROM not set', msg)
+    return { ok: false, error: 'MAIL_FROM not set' }
   }
   try {
     const resend = new Resend(key)
     const { error } = await resend.emails.send({
-      from: process.env.MAIL_FROM || 'pdf-esign <onboarding@resend.dev>',
+      from,
       to: msg.to,
       subject: msg.subject,
       html: msg.html,
@@ -109,6 +132,37 @@ ${msg.text}
 서명하기: ${link}
 
 링크는 본인만 사용하도록 타인과 공유하지 마세요.`
+  return { subject, html, text }
+}
+
+/** To the owner when it is their turn (not the first signer). Links to the admin page, never a token link. */
+export function ownerTurnEmail(doc: DocumentRow, signer: SignerRow, adminLink: string): MailTemplate {
+  const subject = oneLine(`[서명 차례입니다] ${doc.title}`)
+  const html = layout(`
+<h1 style="margin:0 0 16px 0;font-size:20px;">서명 차례입니다</h1>
+<p style="margin:0 0 8px 0;">${escapeHtml(signer.name)}님, 앞 순서 서명자가 서명을 마쳤습니다.</p>
+<p style="margin:12px 0;"><strong>문서:</strong> ${escapeHtml(doc.title)}</p>
+<p style="margin:0 0 8px 0;">관리자 화면에 로그인한 뒤 "지금 서명하기"로 서명하세요.</p>
+${button(adminLink, '관리자 화면에서 열기')}`)
+  const text = `${signer.name}님, 앞 순서 서명자가 서명을 마쳤습니다.
+문서: ${doc.title}
+
+관리자 화면에 로그인한 뒤 "지금 서명하기"로 서명하세요.
+${adminLink}`
+  return { subject, html, text }
+}
+
+/** To the owner when every signer signed but building the sealed PDF failed. */
+export function sealFailedEmail(doc: DocumentRow, adminLink: string): MailTemplate {
+  const subject = oneLine(`[날인본 생성 실패] ${doc.title}`)
+  const html = layout(`
+<h1 style="margin:0 0 16px 0;font-size:20px;">날인본 생성에 실패했습니다</h1>
+<p style="margin:0 0 8px 0;"><strong>${escapeHtml(doc.title)}</strong> 문서의 모든 서명은 저장되었지만 최종 PDF를 만들지 못했습니다.</p>
+<p style="margin:0 0 8px 0;">관리자 화면에서 "알림 재발송"을 누르면 날인본 생성을 다시 시도합니다. 서버 로그에서 원인을 확인하세요.</p>
+${button(adminLink, '관리자 화면에서 열기')}`)
+  const text = `"${doc.title}" 문서의 모든 서명은 저장되었지만 최종 PDF를 만들지 못했습니다.
+관리자 화면에서 "알림 재발송"을 누르면 날인본 생성을 다시 시도합니다.
+${adminLink}`
   return { subject, html, text }
 }
 

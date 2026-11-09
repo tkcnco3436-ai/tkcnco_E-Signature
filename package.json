@@ -4,11 +4,12 @@
   "private": true,
   "description": "Self-hosted PDF e-signature: upload a PDF, sign it yourself, send a link to the other party, both keep the sealed PDF.",
   "scripts": {
-    "dev": "next dev -p 3100",
+    "dev": "next dev -H 127.0.0.1 -p 3100",
     "build": "next build",
-    "start": "next start -p 3100",
+    "start": "next start -H 127.0.0.1 -p 3100",
     "typecheck": "tsc --noEmit",
-    "tunnel": "cloudflared tunnel --url http://localhost:3100"
+    "smoke": "node --import ./scripts/ts-register.mjs --conditions=react-server scripts/smoke-core.mts",
+    "tunnel": "cloudflared tunnel --url http://127.0.0.1:3100"
   },
   "engines": {
     "node": ">=22.5"

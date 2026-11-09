@@ -25,13 +25,14 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
       if ((e as NodeJS.ErrnoException).code === 'ENOENT') return json({ error: '파일을 찾을 수 없습니다.' }, 404)
       throw e
     }
-    const base = (doc.title || 'document').replace(/[\/:*?"<>|\r\n]+/g, '_').slice(0, 150)
-    const name = kind === 'signed' ? `${base}_서명완료.pdf` : `${base}.pdf`
+    // Same naming as the signer download: `<title>_서명완료.pdf` (ASCII fallback `signed.pdf`).
+    const base = (doc.title || 'document').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_').trim().slice(0, 150) || 'document'
+    const name = rfc5987(kind === 'signed' ? `${base}_서명완료.pdf` : `${base}.pdf`)
     return new Response(new Uint8Array(data), {
       headers: {
         'Content-Type': 'application/pdf',
         'Content-Length': String(data.length),
-        'Content-Disposition': `${download ? 'attachment' : 'inline'}; filename="${kind}.pdf"; filename*=UTF-8''${encodeURIComponent(name)}`,
+        'Content-Disposition': `${download ? 'attachment' : 'inline'}; filename="${kind === 'signed' ? 'signed' : 'original'}.pdf"; filename*=UTF-8''${name}`,
         'Cache-Control': 'private, no-store',
         'X-Content-Type-Options': 'nosniff',
       },
@@ -39,4 +40,9 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
   } catch (err) {
     return errorResponse(err, 'file')
   }
+}
+
+// RFC 5987 ext-value: encodeURIComponent leaves ' ( ) * unescaped, which are not attr-chars.
+function rfc5987(s: string): string {
+  return encodeURIComponent(s).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)
 }

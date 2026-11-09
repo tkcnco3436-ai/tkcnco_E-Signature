@@ -39,11 +39,13 @@ copy .env.example .env.local   # 값 채우기
 | 키 | 설명 |
 |---|---|
 | `APP_URL` | 메일 링크의 기준 URL. `scripts/start.ps1`을 쓰면 터널 URL로 자동 덮어씁니다 |
-| `ADMIN_PASSWORD` | 관리자 로그인 비밀번호 |
+| `ADMIN_PASSWORD` | 관리자 로그인 비밀번호. 12자 이상이어야 하며, 바꾸면 기존 로그인 세션이 모두 끊깁니다 |
 | `SESSION_SECRET` | 세션 쿠키 서명 키(32자 이상 무작위 문자열) |
-| `OWNER_NAME`, `OWNER_EMAIL` | 편집 화면에서 "나" 서명자의 기본값 |
+| `OWNER_NAME`, `OWNER_EMAIL` | 편집 화면에서 "나" 서명자의 기본값. 내 서명 차례가 되면 이 주소로 관리자 화면 링크가 갑니다 |
 | `RESEND_API_KEY` | 선택. 없으면 메일 대신 콘솔과 화면에 링크 표시 |
-| `MAIL_FROM` | 발신자. 도메인이 Resend에 인증되어 있어야 합니다 |
+| `MAIL_FROM` | 발신자. 도메인이 Resend에 인증되어 있어야 합니다. `RESEND_API_KEY`가 있는데 비어 있으면 메일을 보내지 않습니다 |
+| `MAIL_DISABLED` | `1`이면 메일을 절대 보내지 않고 콘솔에만 기록합니다(테스트용) |
+| `TRUST_PROXY` | 클라이언트 IP 출처. `none`(기본, 전달 헤더 무시) 또는 `cloudflare`(`cf-connecting-ip`만 신뢰). `start.ps1`은 터널을 켤 때 `cloudflare`로 설정합니다 |
 | `DATA_DIR` | 선택. 데이터 폴더 경로(기본 `./data`) |
 
 ## 실행
@@ -59,18 +61,40 @@ powershell -ExecutionPolicy Bypass -File scripts/start.ps1 -Dev
 npm run dev        # http://localhost:3100
 ```
 
-- 터널 URL은 실행할 때마다 바뀝니다. 상대방이 서명을 마칠 때까지 PC와 창을 켜 두세요.
-- 이미 보낸 메일의 링크는 이전 터널 주소를 가리킵니다. 터널을 다시 열었다면 상세 화면의 "재발송"으로 새 링크를 보내세요.
+- 서버는 `127.0.0.1`에만 바인딩됩니다(같은 PC에서만 직접 접속 가능, 외부 접속은 터널 경유).
+- 빠른 터널(`trycloudflare.com`) URL은 실행할 때마다 바뀝니다. 상대방이 서명을 마칠 때까지 PC와 창을 켜 두세요.
+- 이미 보낸 메일의 링크는 이전 터널 주소를 가리키므로 재시작 후에는 동작하지 않습니다. 상세 화면의 "알림 재발송"을 누르면
+  진행 중 문서는 현재 차례 서명자에게 새 링크를, 완료된 문서는 모든 서명자에게 새 다운로드 링크와 날인본을 다시 보냅니다.
+- `npm run tunnel`을 따로 쓸 때는 `TRUST_PROXY=cloudflare`와 `APP_URL`을 직접 설정하세요.
+
+### 고정 주소: 내 도메인으로 이름 있는 터널
+
+주소가 바뀌지 않게 하려면 Cloudflare에 등록된 내 도메인으로 이름 있는 터널을 만듭니다(무료).
+
+```powershell
+cloudflared tunnel login                                  # 브라우저에서 도메인 선택
+cloudflared tunnel create esign                           # 터널 생성 (자격 증명 파일 생성)
+cloudflared tunnel route dns esign sign.example.com       # DNS CNAME 연결
+cloudflared tunnel run --url http://127.0.0.1:3100 esign  # 실행
+```
+
+`.env.local`에 `APP_URL=https://sign.example.com`, `TRUST_PROXY=cloudflare`를 넣고 `npm start`로 서버를 띄웁니다
+(`start.ps1 -NoTunnel`도 가능). 이렇게 하면 서버를 다시 켜도 이미 보낸 링크가 계속 동작합니다.
 - 코드를 바꾼 뒤에는 `npm run build`를 다시 실행하세요. `start.ps1`은 빌드 결과가 없을 때만 빌드합니다.
 
 ## 테스트
 
 ```powershell
 npm run typecheck
+npm run smoke      # 서버 없이 workflow/날인 핵심 검사 (메일 비활성)
 npm run build
-# 서버 실행 중에:
-node scripts/e2e.mjs http://localhost:3100
+# 테스트용 서버는 반드시 메일을 끄고 별도 데이터 폴더로 실행 (.env.local의 실제 키로 메일이 나가지 않게)
+$env:MAIL_DISABLED='1'; $env:DATA_DIR="$env:TEMP\esign-e2e"; npx next start -H 127.0.0.1 -p 3195
+# 다른 창에서:
+node scripts/e2e.mjs http://localhost:3195
 ```
+
+PowerShell에서 `$env:RESEND_API_KEY=''`는 변수를 지우는 것이라 Next가 `.env.local` 값을 다시 읽습니다. 메일을 막으려면 `MAIL_DISABLED=1`을 쓰세요.
 
 `e2e.mjs`는 업로드, 서명자 지정, 발송, 순서 위반 거부, 토큰 노출 여부, 2인 서명, 날인본 다운로드, PAdES 서명 존재를 확인합니다.
 

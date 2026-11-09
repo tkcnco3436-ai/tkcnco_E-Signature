@@ -60,9 +60,35 @@ export interface FieldFrame {
   toPdf(dx: number, dy: number): { x: number; y: number }
 }
 
+type Box = { x: number; y: number; width: number; height: number }
+
+/** Rect with non-negative width/height (PDF allows any two opposite corners). */
+function normalizeBox(b: Box): Box {
+  const x1 = Math.min(b.x, b.x + b.width)
+  const x2 = Math.max(b.x, b.x + b.width)
+  const y1 = Math.min(b.y, b.y + b.height)
+  const y2 = Math.max(b.y, b.y + b.height)
+  return { x: x1, y: y1, width: x2 - x1, height: y2 - y1 }
+}
+
+/**
+ * The page area pdf.js renders: CropBox ∩ MediaBox (both normalized), falling back to the
+ * MediaBox when the intersection is empty — same rule as pdf.js `Page.view`.
+ */
+export function visibleBox(page: PDFPage): Box {
+  const media = normalizeBox(page.getMediaBox())
+  const crop = normalizeBox(page.getCropBox())
+  const x1 = Math.max(media.x, crop.x)
+  const y1 = Math.max(media.y, crop.y)
+  const x2 = Math.min(media.x + media.width, crop.x + crop.width)
+  const y2 = Math.min(media.y + media.height, crop.y + crop.height)
+  if (x2 - x1 <= 0 || y2 - y1 <= 0) return media
+  return { x: x1, y: y1, width: x2 - x1, height: y2 - y1 }
+}
+
 /** Converts a point given in displayed-page points (u from left, v from top) to PDF user space. */
 export function displayToPdf(page: PDFPage, u: number, v: number): { x: number; y: number } {
-  const crop = page.getCropBox()
+  const crop = visibleBox(page)
   const r = pageRotation(page)
   const { x: cx, y: cy, width: cw, height: ch } = crop
   switch (r) {
@@ -79,7 +105,7 @@ export function displayToPdf(page: PDFPage, u: number, v: number): { x: number; 
 
 /** Displayed page size in points (width/height swap for 90/270). */
 export function displaySize(page: PDFPage): { width: number; height: number } {
-  const { width, height } = page.getCropBox()
+  const { width, height } = visibleBox(page)
   const r = pageRotation(page)
   return r === 90 || r === 270 ? { width: height, height: width } : { width, height }
 }
