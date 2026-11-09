@@ -1,0 +1,39 @@
+{
+  "name": "pdf-esign",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted PDF e-signature: upload a PDF, sign it yourself, send a link to the other party, both keep the sealed PDF.",
+  "scripts": {
+    "dev": "next dev -p 3100",
+    "build": "next build",
+    "start": "next start -p 3100",
+    "typecheck": "tsc --noEmit",
+    "tunnel": "cloudflared tunnel --url http://localhost:3100"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dependencies": {
+    "@pdf-lib/fontkit": "^1.1.1",
+    "@signpdf/placeholder-pdf-lib": "^4.0.0",
+    "@signpdf/signer-p12": "^4.0.0",
+    "@signpdf/signpdf": "^4.0.0",
+    "next": "16.2.4",
+    "node-forge": "^1.4.3",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.5.438",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "resend": "^6.37.0",
+    "server-only": "^0.0.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^22",
+    "@types/node-forge": "^1.3.14",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}
