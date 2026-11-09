@@ -1,0 +1,343 @@
+// End-to-end smoke test of Module A (workflow + sealing) without HTTP.
+// Run:  node --import ./scripts/ts-register.mjs --conditions=react-server scripts/smoke-core.mts
+// (`--conditions=react-server` turns the `server-only` import into a no-op outside Next.)
+// Set KEEP=1 to keep the temp data folder; OUT=<path> to copy the sealed PDF somewhere.
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import zlib from 'node:zlib'
+import crypto from 'node:crypto'
+import assert from 'node:assert/strict'
+
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'esign-smoke-'))
+process.env.DATA_DIR = dataDir
+process.env.APP_URL = 'https://esign.example.test'
+delete process.env.RESEND_API_KEY
+
+const { PDFDocument, StandardFonts, degrees, decodePDFRawStream, PDFRawStream, PDFName, PDFDict } = await import('pdf-lib')
+const forge = (await import('node-forge')).default
+const fontkit = (await import('@pdf-lib/fontkit')).default
+const wf = await import('../lib/workflow.ts')
+const dbm = await import('../lib/db.ts')
+
+const log = (...a: unknown[]) => console.log('  ✓', ...a)
+async function expectWorkflowError(p: Promise<unknown> | (() => unknown), status?: number) {
+  try {
+    await (typeof p === 'function' ? p() : p)
+  } catch (e) {
+    assert.ok(e instanceof wf.WorkflowError, `expected WorkflowError, got ${String(e)}`)
+    if (status) assert.equal(e.status, status)
+    return e.message
+  }
+  assert.fail('expected WorkflowError')
+}
+
+// --- fixtures -------------------------------------------------------------
+async function samplePdf(): Promise<Uint8Array> {
+  const doc = await PDFDocument.create()
+  const font = await doc.embedFont(StandardFonts.Helvetica)
+  const p1 = doc.addPage([595.28, 841.89])
+  p1.drawText('Sample contract - page 1', { x: 50, y: 780, size: 18, font })
+  const p2 = doc.addPage([595.28, 841.89])
+  p2.drawText('Sample contract - page 2 (rotated 90)', { x: 50, y: 780, size: 18, font })
+  p2.setRotation(degrees(90))
+  return doc.save()
+}
+
+function crc32(buf: Buffer): number {
+  let c = ~0
+  for (const b of buf) {
+    c ^= b
+    for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1))
+  }
+  return ~c >>> 0
+}
+function chunk(type: string, data: Buffer): Buffer {
+  const len = Buffer.alloc(4)
+  len.writeUInt32BE(data.length)
+  const td = Buffer.concat([Buffer.from(type, 'latin1'), data])
+  const crc = Buffer.alloc(4)
+  crc.writeUInt32BE(crc32(td))
+  return Buffer.concat([len, td, crc])
+}
+/** 300x100 RGBA PNG with a blue scribble on a transparent background. */
+function signaturePng(): string {
+  const W = 300
+  const H = 100
+  const px = Buffer.alloc(W * H * 4)
+  for (let x = 10; x < W - 10; x++) {
+    const y = Math.round(50 + 30 * Math.sin(x / 18) * Math.cos(x / 47))
+    for (let dy = -2; dy <= 2; dy++) {
+      const i = ((y + dy) * W + x) * 4
+      px[i] = 20
+      px[i + 1] = 40
+      px[i + 2] = 160
+      px[i + 3] = 255
+    }
+  }
+  const raw = Buffer.alloc((W * 4 + 1) * H)
+  for (let y = 0; y < H; y++) px.copy(raw, y * (W * 4 + 1) + 1, y * W * 4, (y + 1) * W * 4)
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(W, 0)
+  ihdr.writeUInt32BE(H, 4)
+  ihdr[8] = 8
+  ihdr[9] = 6
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', zlib.deflateSync(raw)),
+    chunk('IEND', Buffer.alloc(0)),
+  ])
+  return 'data:image/png;base64,' + png.toString('base64')
+}
+
+// --- PAdES verification (manual: forge has no PKCS#7 verify) ---------------
+function verifyPades(pdf: Buffer) {
+  const s = pdf.toString('latin1')
+  const m = /\/ByteRange\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]/.exec(s)
+  assert.ok(m, 'no /ByteRange')
+  const [a, b, c, d] = m.slice(1).map(Number)
+  assert.equal(a, 0)
+  assert.equal(c + d, pdf.length, 'ByteRange must cover the whole file')
+  const contentsHex = s.slice(b + 1, c - 1) // strip < >
+  const signed = Buffer.concat([pdf.subarray(a, a + b), pdf.subarray(c, c + d)])
+  const der = Buffer.from(contentsHex.replace(/(00)+$/, ''), 'hex')
+  const asn1 = forge.asn1.fromDer(forge.util.createBuffer(der.toString('binary')), { strict: false })
+  const p7 = forge.pkcs7.messageFromAsn1(asn1) as forge.pkcs7.PkcsSignedData & {
+    rawCapture: { authenticatedAttributes: forge.asn1.Asn1[]; signature: string }
+  }
+  const cert = p7.certificates[0]
+  assert.equal(cert.subject.getField('CN').value, 'pdf-esign self-signed')
+  const attrs = p7.rawCapture.authenticatedAttributes
+  const mdOid = forge.pki.oids.messageDigest
+  let md: string | undefined
+  for (const attr of attrs) {
+    const seq = attr.value as forge.asn1.Asn1[]
+    if (forge.asn1.derToOid(seq[0].value as string) === mdOid) {
+      md = ((seq[1].value as forge.asn1.Asn1[])[0].value as string)
+    }
+  }
+  assert.ok(md, 'no messageDigest attribute')
+  const digest = crypto.createHash('sha256').update(signed).digest()
+  assert.equal(Buffer.from(md, 'binary').toString('hex'), digest.toString('hex'), 'messageDigest != SHA-256(ByteRange)')
+  const set = forge.asn1.create(forge.asn1.Class.UNIVERSAL, forge.asn1.Type.SET, true, attrs)
+  const setDer = Buffer.from(forge.asn1.toDer(set).getBytes(), 'binary')
+  const pem = forge.pki.certificateToPem(cert)
+  const ok = crypto.verify('sha256', setDer, pem, Buffer.from(p7.rawCapture.signature, 'binary'))
+  assert.ok(ok, 'RSA signature over signed attributes does not verify')
+  // Tamper check: flipping one byte inside the signed range must break the digest.
+  const tampered = Buffer.from(signed)
+  tampered[100] ^= 0xff
+  assert.notEqual(crypto.createHash('sha256').update(tampered).digest('hex'), digest.toString('hex'))
+}
+
+// --- embedded font sanity: subset glyphs must have outlines -----------------
+async function checkEmbeddedFont(pdfBytes: Uint8Array) {
+  const doc = await PDFDocument.load(pdfBytes, { updateMetadata: false })
+  let checked = 0
+  for (const [, obj] of doc.context.enumerateIndirectObjects()) {
+    if (!(obj instanceof PDFDict)) continue
+    const ff = obj.lookup(PDFName.of('FontFile2'))
+    if (!(ff instanceof PDFRawStream)) continue
+    const bytes = decodePDFRawStream(ff).decode()
+    const f = fontkit.create(Buffer.from(bytes)) as unknown as {
+      numGlyphs: number
+      getGlyph(id: number): { path: { commands: unknown[] } }
+    }
+    let withPath = 0
+    for (let g = 1; g < f.numGlyphs; g++) {
+      try {
+        if (f.getGlyph(g).path.commands.length > 0) withPath++
+      } catch {
+        /* undecodable glyph counts as missing */
+      }
+    }
+    assert.ok(f.numGlyphs > 50, `embedded font has only ${f.numGlyphs} glyphs`)
+    assert.ok(withPath / (f.numGlyphs - 1) > 0.85, `only ${withPath}/${f.numGlyphs - 1} glyphs have outlines`)
+    log(`embedded font: ${f.numGlyphs} glyphs, ${withPath} with outlines`)
+    checked++
+  }
+  assert.ok(checked >= 1, 'no embedded TrueType font found')
+}
+
+// --- run --------------------------------------------------------------------
+console.log(`smoke-core: DATA_DIR=${dataDir}`)
+const pdfBytes = await samplePdf()
+const sig = signaturePng()
+const info = { ip: '203.0.113.7', userAgent: 'smoke-test/1.0 (Windows NT 10.0) Chrome/130' }
+
+await expectWorkflowError(wf.createDocument({ title: 'x', pdf: new TextEncoder().encode('not a pdf') }), 400)
+log('createDocument rejects non-PDF')
+
+const doc = await wf.createDocument({ title: '용역 계약서 (smoke)', pdf: pdfBytes, message: '검토 후 서명 부탁드립니다.\n<script>x</script>' })
+assert.equal(doc.page_count, 2)
+assert.equal(doc.status, 'draft')
+log('createDocument', doc.id)
+
+const signers = [
+  { name: '김태경', email: 'owner@example.com', is_owner: true, order_index: 0 },
+  { name: '홍길동', email: 'hong@example.com', is_owner: false, order_index: 1 },
+]
+const fields = [
+  { signer_ref: 0, page: 1, x: 0.1, y: 0.75, w: 0.3, h: 0.08, type: 'signature' as const },
+  { signer_ref: 0, page: 1, x: 0.1, y: 0.84, w: 0.2, h: 0.03, type: 'date' as const, label: '날짜' },
+  { signer_ref: 0, page: 1, x: 0.35, y: 0.84, w: 0.2, h: 0.03, type: 'name' as const },
+  { signer_ref: 1, page: 1, x: 0.55, y: 0.75, w: 0.3, h: 0.08, type: 'signature' as const },
+  { signer_ref: 1, page: 1, x: 0.55, y: 0.65, w: 0.35, h: 0.04, type: 'text' as const, label: '회사명' },
+  { signer_ref: 1, page: 2, x: 0.6, y: 0.1, w: 0.3, h: 0.1, type: 'signature' as const },
+  { signer_ref: 1, page: 2, x: 0.6, y: 0.22, w: 0.3, h: 0.04, type: 'name' as const },
+]
+
+await expectWorkflowError(() => wf.saveDraft(doc.id, { signers, fields: fields.filter((f) => f.signer_ref === 0) }))
+log('saveDraft rejects signer without signature field')
+await expectWorkflowError(() =>
+  wf.saveDraft(doc.id, { signers: signers.map((s) => ({ ...s, is_owner: true })), fields }),
+)
+log('saveDraft rejects two owners')
+await expectWorkflowError(() =>
+  wf.saveDraft(doc.id, { signers: signers.map((s) => ({ ...s, order_index: 0 })), fields }),
+)
+log('saveDraft rejects duplicate order_index')
+await expectWorkflowError(() =>
+  wf.saveDraft(doc.id, { signers: [{ ...signers[0] }, { ...signers[1], email: 'bad@' }], fields }),
+)
+log('saveDraft rejects invalid email')
+
+let bundle = wf.saveDraft(doc.id, { signers, fields })
+assert.equal(bundle.signers.length, 2)
+assert.equal(bundle.fields.length, 7)
+// Saving again with ids keeps tokens stable.
+const tokensBefore = bundle.signers.map((s) => s.token)
+bundle = wf.saveDraft(doc.id, {
+  title: '용역 계약서 (smoke)',
+  signers: bundle.signers.map((s) => ({ id: s.id, name: s.name, email: s.email, is_owner: !!s.is_owner, order_index: s.order_index })),
+  fields,
+})
+assert.deepEqual(bundle.signers.map((s) => s.token), tokensBefore)
+log('saveDraft (twice, tokens stable)')
+
+const [owner, ext] = bundle.signers
+assert.equal(wf.signLink(owner.token), `https://esign.example.test/sign/${owner.token}`)
+
+const sent = await wf.sendDocument(doc.id)
+assert.equal(sent.notified.length, 1)
+assert.equal(sent.notified[0].signerId, owner.id)
+assert.equal(sent.notified[0].emailed, false)
+await expectWorkflowError(wf.sendDocument(doc.id), 409)
+log('sendDocument -> owner notified via link only')
+
+await expectWorkflowError(() => wf.saveDraft(doc.id, { signers, fields }), 409)
+log('saveDraft blocked after send')
+
+const extView = wf.signerView(ext.token)
+assert.ok(extView && !extView.canSign && extView.reason)
+await expectWorkflowError(wf.submitSignature(ext.token, { signaturePng: sig, values: {}, consent: true }, info), 409)
+log('external signer blocked until owner signs:', extView.reason)
+
+assert.equal(wf.signerView('f'.repeat(64)), undefined)
+const ownerView = wf.signerView(owner.token)
+assert.ok(ownerView?.canSign)
+wf.markViewed(owner.token, info)
+wf.markViewed(owner.token, info) // second view: no duplicate event
+assert.equal(dbm.getEvents(doc.id).filter((e) => e.type === 'viewed').length, 1)
+log('signerView / markViewed')
+
+await expectWorkflowError(
+  wf.submitSignature(owner.token, { signaturePng: 'data:image/jpeg;base64,AAAA', values: {}, consent: true }, info),
+)
+await expectWorkflowError(
+  wf.submitSignature(owner.token, { signaturePng: sig, values: {}, consent: false as unknown as true }, info),
+)
+log('submitSignature rejects bad PNG / missing consent')
+
+const r1 = await wf.submitSignature(owner.token, { signaturePng: sig, values: {}, consent: true }, info)
+assert.equal(r1.completed, false)
+await expectWorkflowError(wf.submitSignature(owner.token, { signaturePng: sig, values: {}, consent: true }, info), 409)
+const afterOwner = dbm.getBundle(doc.id)!
+const ownerDate = afterOwner.fields.find((f) => f.signer_id === owner.id && f.type === 'date')!
+assert.match(ownerDate.value ?? '', /^\d{4}-\d{2}-\d{2}$/)
+assert.equal(afterOwner.fields.find((f) => f.signer_id === owner.id && f.type === 'name')!.value, '김태경')
+assert.ok(afterOwner.events.some((e) => e.type === 'email_failed' && e.signer_id === ext.id))
+log('owner signed (date auto-filled', ownerDate.value + '), next signer notified (email_failed logged, no key)')
+
+const extFields = afterOwner.fields.filter((f) => f.signer_id === ext.id)
+const textField = extFields.find((f) => f.type === 'text')!
+await expectWorkflowError(wf.submitSignature(ext.token, { signaturePng: sig, values: {}, consent: true }, info))
+log('external: required text field enforced')
+
+const r2 = await wf.submitSignature(
+  ext.token,
+  { signaturePng: sig, values: { [textField.id]: '태경씨앤코 주식회사' }, consent: true },
+  { ip: '198.51.100.23', userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1' },
+)
+assert.equal(r2.completed, true)
+
+const final = dbm.getBundle(doc.id)!
+assert.equal(final.document.status, 'completed')
+assert.ok(final.document.completed_at)
+const signedFile = fs.readFileSync(dbm.signedPdfPath(doc.id))
+assert.equal(final.document.signed_sha256, dbm.sha256(signedFile))
+assert.equal(signedFile.subarray(0, 5).toString('latin1'), '%PDF-')
+assert.ok(signedFile.includes('/ByteRange'), 'missing /ByteRange')
+assert.ok(signedFile.includes('/adbe.pkcs7.detached'), 'missing SubFilter')
+const reopened = await PDFDocument.load(signedFile, { updateMetadata: false })
+assert.equal(reopened.getPageCount(), doc.page_count + 1, 'expected original pages + 1 audit page')
+assert.ok(final.events.filter((e) => e.type === 'email_failed').length >= 3) // next-signer + 2 completion mails
+log(`completed: ${signedFile.length} bytes, ${reopened.getPageCount()} pages, sha256 ${final.document.signed_sha256}`)
+
+if (process.env.OUT) {
+  fs.writeFileSync(process.env.OUT, signedFile)
+  console.log('  sealed PDF copied to', process.env.OUT)
+}
+
+verifyPades(signedFile)
+log('PAdES: ByteRange covers file, messageDigest matches, RSA signature verifies with embedded cert')
+
+await checkEmbeddedFont(signedFile)
+
+// Text extraction (checks Korean ToUnicode mapping) via pdfjs-dist.
+const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs')
+const loaded = await pdfjs.getDocument({ data: new Uint8Array(signedFile), isEvalSupported: false }).promise
+const pageText = async (n: number) =>
+  (await (await loaded.getPage(n)).getTextContent()).items.map((i) => ('str' in i ? i.str : '')).join('')
+const t1 = await pageText(1)
+const t2 = await pageText(2)
+const t3 = await pageText(3)
+assert.ok(t1.includes('태경씨앤코 주식회사'), 'page 1 missing stamped Korean text: ' + t1)
+assert.ok(t1.includes('김태경'), 'page 1 missing owner name')
+assert.ok(t2.includes('홍길동'), 'page 2 (rotated) missing name')
+for (const needle of ['전자서명 감사 증명서', doc.id, doc.original_sha256, '홍길동', 'hong@example.com', '198.51.100.23', 'PAdES'])
+  assert.ok(t3.includes(needle), `audit page missing "${needle}"`)
+log('text extraction: stamped Korean values + audit page content present')
+
+// Session token + http helpers
+const sess = await import('../lib/session.ts')
+const http = await import('../lib/http.ts')
+const secret = 'x'.repeat(40)
+const tok = await sess.signSessionToken(secret)
+assert.ok(await sess.verifySessionToken(secret, tok))
+assert.ok(!(await sess.verifySessionToken('y'.repeat(40), tok)))
+assert.ok(!(await sess.verifySessionToken(secret, tok.slice(0, -2) + (tok.endsWith('A') ? 'BB' : 'AA'))))
+assert.ok(!(await sess.verifySessionToken(secret, await sess.signSessionToken(secret, Date.now() - 8 * 86400e3))))
+const ci = http.clientInfo(
+  new Request('http://x', { headers: { 'x-forwarded-for': '1.2.3.4, 10.0.0.1', 'user-agent': 'u'.repeat(400) } }),
+)
+assert.equal(ci.ip, '1.2.3.4')
+assert.equal(ci.userAgent?.length, 300)
+assert.equal(http.clientInfo(new Request('http://x', { headers: { 'cf-connecting-ip': '9.9.9.9', 'x-real-ip': '8.8.8.8' } })).ip, '9.9.9.9')
+assert.deepEqual([1, 2, 3].map(() => http.rateLimit('k', 2, 60_000)), [true, true, false])
+log('session token sign/verify/tamper/expiry, clientInfo, rateLimit')
+
+// Void/delete guards
+await expectWorkflowError(() => wf.voidDocument(doc.id), 409)
+const doc2 = await wf.createDocument({ title: 'to delete', pdf: pdfBytes })
+wf.voidDocument(doc2.id)
+assert.equal(dbm.getDocument(doc2.id)!.status, 'voided')
+wf.deleteDocument(doc2.id)
+assert.equal(dbm.getDocument(doc2.id), undefined)
+assert.ok(!fs.existsSync(dbm.docDir(doc2.id)))
+log('void/delete')
+
+dbm.db().close()
+if (!process.env.KEEP) fs.rmSync(dataDir, { recursive: true, force: true })
+console.log('smoke-core: ALL PASSED')
