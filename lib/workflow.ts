@@ -20,9 +20,10 @@ import {
   tx,
 } from './db'
 import { completedEmail, sealFailedEmail, sendMail, signRequestEmail } from './mail'
+import { issueOtp, otpRequired, otpVerifiedRecently, verifyOtp } from './otp'
 import { PdfValidationError, validatePdf } from './pdf'
-import { buildSealedPdf } from './seal'
-import { kstDate } from './time'
+import { buildSealedPdf, type SealResult } from './seal'
+import { kstDate, kstDateTime } from './time'
 import type { DocumentBundle, DocumentRow, FieldType, SignerRow } from './types'
 
 /** Error with an HTTP status, thrown by every workflow function on invalid input/state. */
@@ -370,6 +371,27 @@ export function markViewed(token: string, info: ClientInfo): void {
   })
 }
 
+/** Signer whose turn it is now (valid token, document `sent`, not signed, earlier signers done). */
+function otpSigner(token: string): { doc: DocumentRow; signer: SignerRow } {
+  const view = signerView(token)
+  if (!view) throw new WorkflowError('유효하지 않은 서명 링크입니다.', 404)
+  if (!view.canSign) throw new WorkflowError(view.reason ?? '서명할 수 없습니다.', 409)
+  if (!otpRequired()) throw new WorkflowError('이메일 인증이 필요하지 않습니다.', 409)
+  return { doc: view.bundle.document, signer: view.signer }
+}
+
+/** Sends a new email OTP. Throws WorkflowError (404/409) or OtpError (429 cooldown/limit, 502 mail). */
+export async function requestSignerOtp(token: string, info: ClientInfo) {
+  const { doc, signer } = otpSigner(token)
+  return issueOtp(doc, signer.id, info)
+}
+
+/** Verifies an email OTP. Throws WorkflowError (404/409) or OtpError (400/410/429). */
+export function verifySignerOtp(token: string, code: unknown, info: ClientInfo) {
+  const { doc, signer } = otpSigner(token)
+  return verifyOtp(doc, signer.id, code, info)
+}
+
 /**
  * Validates the signature PNG fully before it is stored, so a bad image can never make sealing
  * fail later: data-URL shape, size, PNG magic, IHDR dimensions (max 3000x1500), and a trial
@@ -473,6 +495,8 @@ export async function submitSignature(
   const doc = bundle.document
   const check = turnCheck(doc, signer, bundle.signers)
   if (!check.canSign) throw new WorkflowError(check.reason ?? '서명할 수 없습니다.', 409)
+  if (otpRequired() && !otpVerifiedRecently(bundle.signers.find((s) => s.id === signer.id) ?? signer))
+    throw new WorkflowError('이메일 인증이 필요합니다.', 403)
 
   const today = kstDate()
   const updates: { id: string; value: string }[] = []
@@ -586,9 +610,9 @@ async function finalizeDocument(documentId: string, opts: { throwOnFailure?: boo
       ...bundle,
       document: { ...bundle.document, status: 'completed', completed_at: completedAt },
     }
-    let bytes: Uint8Array
+    let sealed: SealResult
     try {
-      bytes = await buildSealedPdf(forSeal)
+      sealed = await buildSealedPdf(forSeal)
     } catch (err) {
       console.error('[workflow] sealing failed for', documentId, err)
       const to = ownerEmail(bundle.signers)
@@ -604,6 +628,7 @@ async function finalizeDocument(documentId: string, opts: { throwOnFailure?: boo
         throw new WorkflowError('최종 PDF 생성에 다시 실패했습니다. 서버 로그를 확인하세요.', 500)
       return false
     }
+    const { bytes, timestamp } = sealed
     const hash = sha256(bytes)
     const finalPath = signedPdfPath(documentId)
     fs.mkdirSync(docDir(documentId), { recursive: true })
@@ -621,10 +646,14 @@ async function finalizeDocument(documentId: string, opts: { throwOnFailure?: boo
     const done = tx(() => {
       const r = db()
         .prepare(
-          "UPDATE documents SET status = 'completed', signed_sha256 = ?, completed_at = ? WHERE id = ? AND status = 'sent'",
+          "UPDATE documents SET status = 'completed', signed_sha256 = ?, completed_at = ?, timestamp_at = ?, timestamp_tsa = ? WHERE id = ? AND status = 'sent'",
         )
-        .run(hash, completedAt, documentId)
+        .run(hash, completedAt, timestamp?.at.toISOString() ?? null, timestamp?.tsa ?? null, documentId)
       if (Number(r.changes) !== 1) return false
+      if (timestamp)
+        logEvent({ document_id: documentId, type: 'timestamped', detail: `TSA ${timestamp.tsa} · ${kstDateTime(timestamp.at)}` })
+      else if (sealed.timestampError)
+        logEvent({ document_id: documentId, type: 'timestamp_failed', detail: sealed.timestampError })
       logEvent({ document_id: documentId, type: 'completed', detail: `서명본 SHA-256 ${hash}` })
       return true
     })

@@ -26,6 +26,22 @@ export interface SignViewResponse {
   canSign: boolean
   reason: string | null
   progress: { signed: number; total: number }
+  // Email OTP identity check. required=false when SIGN_OTP=off or mail is not configured (then signing works without it).
+  // verified: a code was confirmed within the last 30 minutes. email_masked: e.g. "hl****@tkcnco.com".
+  otp: { required: boolean; verified: boolean; email_masked: string }
+}
+
+/** POST /api/sign/[token]/otp -> 200. Errors: { error, retry_after? } (429 cooldown/limit). */
+export interface OtpSendResponse {
+  ok: true
+  expires_in: number // seconds
+  resend_in: number // seconds
+}
+
+/** POST /api/sign/[token]/otp/verify { code }. Errors: { error, remaining? } (400 wrong, 410 expired, 429 too many). */
+export interface OtpVerifyResponse {
+  ok: true
+  verified_at: string
 }
 
 export interface SignSubmitBody {

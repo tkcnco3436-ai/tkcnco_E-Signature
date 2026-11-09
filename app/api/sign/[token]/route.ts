@@ -1,4 +1,5 @@
 import { clientInfo, rateLimit } from '@/lib/http'
+import { otpStatus } from '@/lib/otp'
 import { markViewed, signerView, submitSignature, WorkflowError } from '@/lib/workflow'
 import type { SignField, SignSubmitBody, SignViewResponse } from '@/components/sign/types'
 
@@ -70,6 +71,7 @@ export async function GET(req: Request, ctx: Ctx) {
     canSign,
     reason: reason ?? null,
     progress: { signed: bundle.signers.filter((s) => s.status === 'signed').length, total: bundle.signers.length },
+    otp: otpStatus(signer),
   }
   return json(body)
 }

@@ -5,7 +5,7 @@ import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import type { DocumentBundle, EventRow, EventType, SignerRow } from '@/lib/types'
 import StatusBadge from './StatusBadge'
-import { fmtDateTime, signerColor, signerStatusLabel } from './format'
+import { fmtDateTime, fmtDateTimeSec, signerColor, signerStatusLabel, tsaName } from './format'
 
 type Notified = { signerId: string; link: string; emailed: boolean }
 type NotifiedKind = 'request' | 'completed'
@@ -299,6 +299,24 @@ export default function DocumentDetail({ bundle, links }: { bundle: DocumentBund
           )}
         </span>
       </div>
+
+      {doc.status === 'completed' && (
+        <p className="-mt-2 text-xs text-[var(--muted)]">
+          {doc.timestamp_at ? (
+            <>
+              공인 타임스탬프: <span className="tabular-nums">{fmtDateTimeSec(doc.timestamp_at)}</span> ({tsaName(doc.timestamp_tsa)})
+            </>
+          ) : (
+            <>
+              공인 타임스탬프 없음
+              {(() => {
+                const f = events.findLast((e) => e.type === 'timestamp_failed')
+                return f?.detail ? ` — ${f.detail}` : ''
+              })()}
+            </>
+          )}
+        </p>
+      )}
 
       {sealFailed && (
         <div role="alert" className="flex flex-col gap-2 rounded-md border border-red-300 bg-red-50 px-4 py-3 sm:flex-row sm:items-center">

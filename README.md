@@ -45,6 +45,8 @@ copy .env.example .env.local   # 값 채우기
 | `RESEND_API_KEY` | 선택. 없으면 메일 대신 콘솔과 화면에 링크 표시 |
 | `MAIL_FROM` | 발신자. 도메인이 Resend에 인증되어 있어야 합니다. `RESEND_API_KEY`가 있는데 비어 있으면 메일을 보내지 않습니다 |
 | `MAIL_DISABLED` | `1`이면 메일을 절대 보내지 않고 콘솔에만 기록합니다(테스트용) |
+| `SIGN_OTP` | 서명 전 이메일 본인 확인. `on`(기본) 또는 `off`. 메일을 실제로 보낼 수 있을 때만 적용됩니다(아래 "이메일 본인 확인(OTP)" 참고) |
+| `OTP_TEST_MODE` | 테스트 전용. `MAIL_DISABLED=1`과 함께 `1`로 두면 OTP를 요구하되 인증번호를 메일 대신 서버 콘솔에 출력합니다 |
 | `TRUST_PROXY` | 클라이언트 IP 출처. `none`(기본, 전달 헤더 무시) 또는 `cloudflare`(`cf-connecting-ip`만 신뢰). `start.ps1`은 터널을 켤 때 `cloudflare`로 설정합니다 |
 | `DATA_DIR` | 선택. 데이터 폴더 경로(기본 `./data`) |
 
@@ -82,11 +84,41 @@ cloudflared tunnel run --url http://127.0.0.1:3100 esign  # 실행
 (`start.ps1 -NoTunnel`도 가능). 이렇게 하면 서버를 다시 켜도 이미 보낸 링크가 계속 동작합니다.
 - 코드를 바꾼 뒤에는 `npm run build`를 다시 실행하세요. `start.ps1`은 빌드 결과가 없을 때만 빌드합니다.
 
+## 이메일 본인 확인(OTP)
+
+서명 링크만 있으면 누구나 서명할 수 있는 문제를 줄이기 위해, 서명자가 "서명 완료"를 누르면 서명 요청을 받은 이메일 주소로 6자리 인증번호를 보내고 이를 입력해야 제출되게 합니다. 화면에는 `hl****@example.com`처럼 가려진 주소만 보이며, 인증에 성공하면 서명이 자동으로 제출됩니다.
+
+인증번호는 10분간 유효하고, 하나의 번호에 5번 틀리면 그 번호는 무효가 되어 새로 받아야 합니다. 재발송은 60초 간격으로 가능하며 서명자 한 명당 1시간에 5번까지 보낼 수 있습니다. 인증에 성공하면 30분 안에 서명을 제출해야 하고, 이 시간이 지나면 다시 인증해야 합니다. 서버에는 인증번호 자체가 아니라 HMAC 값만 저장되며, 발송·성공·실패는 IP와 브라우저 정보와 함께 이벤트 기록에 남고, 감사 증명서의 서명자 항목에 "본인 확인: 이메일 OTP 인증 (시각)"으로 표시됩니다.
+
+이 기능은 `SIGN_OTP=on`(기본값)이면서 메일을 실제로 보낼 수 있을 때(`RESEND_API_KEY`와 `MAIL_FROM`이 있고 `MAIL_DISABLED`가 아닐 때)만 적용됩니다. 메일 설정이 없으면 인증 없이 이전처럼 서명할 수 있고, 서명 화면 API 응답의 `otp.required`가 `false`가 됩니다. 끄려면 `SIGN_OTP=off`로 설정하세요.
+
+테스트할 때는 `MAIL_DISABLED=1`과 `OTP_TEST_MODE=1`을 함께 설정하면 메일을 보내지 않으면서도 OTP를 요구하고, 인증번호를 서버 콘솔에 `[otp] <이메일> <인증번호>` 형태로 출력합니다. 운영 환경에서는 `OTP_TEST_MODE`를 설정하지 마세요.
+
+## 공인 타임스탬프(RFC 3161)
+
+날인할 때 PAdES 서명값의 SHA-256을 외부 시점확인 기관(TSA)에 보내 RFC 3161 타임스탬프 토큰을 받고, 이를 서명 안에 서명 타임스탬프(`id-aa-signatureTimeStampToken`)로 넣습니다. 이 토큰은 "이 서명값이 TSA가 기록한 시각에 이미 존재했다"는 것을 TSA가 자기 인증서로 서명해 보증하는 것입니다. 서명 시각이 내 서버 시계가 아니라 제3자가 보증한 시각이 되므로, 나중에 서버 시간을 조작했다거나 날인본을 뒤늦게 만들었다는 주장에 대응할 수 있습니다.
+
+기본 TSA는 DigiCert(`http://timestamp.digicert.com`)입니다. 무료이고 가입이 필요 없으며, Adobe 신뢰 목록에 들어 있어 Acrobat/Reader가 별도 설정 없이 신뢰합니다. 요청은 문서 한 건당 한 번, 서명값의 해시만 보내므로 문서 내용은 외부로 나가지 않습니다.
+
+| 환경 변수 | 기본값 | 설명 |
+|---|---|---|
+| `TSA_URL` | `http://timestamp.digicert.com` | 사용할 TSA. `http://timestamp.sectigo.com`, `https://freetsa.org/tsr`도 동작을 확인했습니다. FreeTSA는 Adobe 기본 신뢰 목록에 없습니다. |
+| `TSA_ENABLED` | 켜짐 | `0`/`off`면 타임스탬프 없이 날인합니다. |
+| `TSA_REQUIRED` | 꺼짐 | 켜면 TSA 실패 시 날인 자체를 실패로 처리합니다. 문서는 "날인본 생성 실패" 상태로 남고 상세 화면의 "다시 시도"로 재시도합니다. 끈 상태에서는 TSA가 응답하지 않아도(15초 제한) 타임스탬프 없이 날인을 마칩니다. |
+
+결과는 이벤트 기록에 "타임스탬프"(TSA 주소와 시각) 또는 "타임스탬프 실패"(오류 내용)로 남고, 관리자 문서 상세 화면의 "서명 완료본 다운로드" 아래에 "공인 타임스탬프: 시각 (DigiCert)"로 표시됩니다. 이 이벤트는 날인 이후에 기록되므로 PDF 안의 감사 증명서에는 나오지 않습니다.
+
+Adobe Acrobat Reader에서 확인하는 방법: 날인본을 열고 서명 패널을 연 뒤 서명을 펼치면 "서명에 타임스탬프가 포함되어 있습니다"가 보입니다. 서명을 우클릭해 "서명 속성 표시"를 누르면 서명 시각이 TSA 기준 시각으로 나오고, "날짜/시간" 탭(타임스탬프)의 "속성 표시"에서 TSA 인증서(DigiCert Timestamp Responder)를 볼 수 있습니다.
+
+주의할 점은 문서에 서명하는 인증서 자체는 여전히 자체 서명 인증서(`data/cert.p12`)라는 것입니다. 그래서 Adobe는 타임스탬프는 신뢰하더라도 서명자 신원은 "확인할 수 없음"으로 표시합니다. 서명자 신원까지 신뢰받으려면 공인 인증기관 인증서로 교체해야 합니다.
+
+명령줄 검증: `node --import ./scripts/ts-register.mjs --conditions=react-server scripts/verify-sealed.mts <날인본.pdf> [--require-timestamp]`는 ByteRange, messageDigest, 서명 인증서의 RSA 서명, 타임스탬프의 messageImprint, TSA 토큰 자체의 서명을 모두 확인하고 TSA 시각과 TSA 인증서 주체를 출력합니다.
+
 ## 테스트
 
 ```powershell
 npm run typecheck
-npm run smoke      # 서버 없이 workflow/날인 핵심 검사 (메일 비활성)
+npm run smoke      # 서버 없이 workflow/날인 핵심 검사 (메일 비활성, DigiCert TSA를 한 번 호출. 끄려면 $env:SMOKE_TSA='0')
 npm run build
 # 테스트용 서버는 반드시 메일을 끄고 별도 데이터 폴더로 실행 (.env.local의 실제 키로 메일이 나가지 않게)
 $env:MAIL_DISABLED='1'; $env:DATA_DIR="$env:TEMP\esign-e2e"; npx next start -H 127.0.0.1 -p 3195
@@ -122,11 +154,13 @@ lib/
   db.ts, types.ts           SQLite 스키마와 타입
   workflow.ts               모든 상태 전이 (생성, 발송, 서명, 완료)
   seal.ts, pdf.ts           날인본 생성, 감사 페이지, PAdES
+  tsa.ts                    RFC 3161 타임스탬프 요청/파싱
   mail.ts                   Resend 메일과 템플릿
   auth.ts, http.ts          관리자 세션, IP 확인, 요청 제한
 scripts/
   start.ps1                 서버 + 터널 실행
   e2e.mjs                   HTTP 종단 테스트
+  verify-sealed.mts         날인본 서명·타임스탬프 검증
 docs/PLAN.md                설계 문서
 ```
 

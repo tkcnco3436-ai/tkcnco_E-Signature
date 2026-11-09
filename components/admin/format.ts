@@ -20,6 +20,37 @@ export function fmtDateTime(iso: string | null | undefined): string {
   return Number.isNaN(d.getTime()) ? '-' : kst.format(d)
 }
 
+const kstSec = new Intl.DateTimeFormat('ko-KR', {
+  timeZone: 'Asia/Seoul',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+})
+
+/** Date-time with seconds, KST (used for the RFC 3161 timestamp). */
+export function fmtDateTimeSec(iso: string | null | undefined): string {
+  if (!iso) return '-'
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? '-' : `${kstSec.format(d)} KST`
+}
+
+/** Friendly TSA name from its URL (DigiCert, Sectigo, FreeTSA, else the host). */
+export function tsaName(url: string | null | undefined): string {
+  if (!url) return '-'
+  let host = url
+  try {
+    host = new URL(url).hostname
+  } catch {}
+  if (host.includes('digicert')) return 'DigiCert'
+  if (host.includes('sectigo')) return 'Sectigo'
+  if (host.includes('freetsa')) return 'FreeTSA'
+  return host
+}
+
 export function fmtDate(iso: string | null | undefined): string {
   if (!iso) return '-'
   const d = new Date(iso)

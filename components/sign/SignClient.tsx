@@ -190,6 +190,8 @@ function SignForm({ data, base, onDone }: { data: SignViewResponse; base: string
   const [error, setError] = useState<string | null>(null)
   const [flashId, setFlashId] = useState<string | null>(null)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [otpVerified, setOtpVerified] = useState(data.otp.verified)
+  const [otpOpen, setOtpOpen] = useState(false)
   const consentRef = useRef<HTMLInputElement>(null)
   const textFields = useMemo(() => myFields.filter((f) => f.type !== 'signature'), [myFields])
 
@@ -229,8 +231,14 @@ function SignForm({ data, base, onDone }: { data: SignViewResponse; base: string
     window.setTimeout(() => (el as HTMLElement).focus({ preventScroll: true }), 350)
   }
 
-  const submit = async () => {
+  const submit = async (skipOtpCheck = false) => {
     if (!ready || !signature) return
+    // Email OTP: verify first, then this runs again automatically (onVerified).
+    if (data.otp.required && !otpVerified && !skipOtpCheck) {
+      setError(null)
+      setOtpOpen(true)
+      return
+    }
     setSubmitting(true)
     setError(null)
     const body: SignSubmitBody = {
@@ -246,8 +254,14 @@ function SignForm({ data, base, onDone }: { data: SignViewResponse; base: string
       })
       const json = await res.json().catch(() => null)
       if (!res.ok) {
-        setError(json?.error ?? '서명을 제출하지 못했습니다. 다시 시도해 주세요.')
         setSubmitting(false)
+        if (res.status === 403 && data.otp.required) {
+          // Verification expired (30 min) or missing: ask again.
+          setOtpVerified(false)
+          setOtpOpen(true)
+          return
+        }
+        setError(json?.error ?? '서명을 제출하지 못했습니다. 다시 시도해 주세요.')
         return
       }
       await onDone({ completed: !!json?.completed })
@@ -378,6 +392,19 @@ function SignForm({ data, base, onDone }: { data: SignViewResponse; base: string
             const id = editingId
             setEditingId(null)
             document.getElementById(`field-${id}`)?.focus({ preventScroll: true })
+          }}
+        />
+      )}
+
+      {otpOpen && (
+        <OtpSheet
+          base={base}
+          emailMasked={data.otp.email_masked}
+          onClose={() => setOtpOpen(false)}
+          onVerified={() => {
+            setOtpVerified(true)
+            setOtpOpen(false)
+            void submit(true)
           }}
         />
       )}
@@ -590,6 +617,185 @@ function FieldSheet({
               완료
             </button>
           </div>
+        </form>
+      </div>
+    </>
+  )
+}
+
+// Bottom sheet for the email OTP: request a code, enter 6 digits, confirm. Stays above the on-screen keyboard.
+function OtpSheet({
+  base,
+  emailMasked,
+  onVerified,
+  onClose,
+}: {
+  base: string
+  emailMasked: string
+  onVerified: () => void
+  onClose: () => void
+}) {
+  const [sent, setSent] = useState(false)
+  const [cooldown, setCooldown] = useState(0)
+  const [code, setCode] = useState('')
+  const [busy, setBusy] = useState<'send' | 'verify' | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [info, setInfo] = useState<string | null>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const closeRef = useRef(onClose)
+  closeRef.current = onClose
+  const [kb, setKb] = useState(0)
+  useEffect(() => {
+    const vv = window.visualViewport
+    if (!vv) return
+    const update = () => setKb(Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop)))
+    update()
+    vv.addEventListener('resize', update)
+    vv.addEventListener('scroll', update)
+    return () => {
+      vv.removeEventListener('resize', update)
+      vv.removeEventListener('scroll', update)
+    }
+  }, [])
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closeRef.current()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [])
+  useEffect(() => {
+    if (cooldown <= 0) return
+    const t = window.setTimeout(() => setCooldown((c) => Math.max(0, c - 1)), 1000)
+    return () => window.clearTimeout(t)
+  }, [cooldown])
+
+  const send = async () => {
+    if (busy || cooldown > 0) return
+    setBusy('send')
+    setError(null)
+    setInfo(null)
+    try {
+      const res = await fetch(`${base}/otp`, { method: 'POST' })
+      const json = await res.json().catch(() => null)
+      if (typeof json?.retry_after === 'number') setCooldown(json.retry_after)
+      if (!res.ok) {
+        setError(json?.error ?? '인증번호를 보내지 못했습니다. 잠시 후 다시 시도해 주세요.')
+        return
+      }
+      setSent(true)
+      setCode('')
+      setCooldown(typeof json?.resend_in === 'number' ? json.resend_in : 60)
+      setInfo('인증번호를 보냈습니다. 메일함(스팸함 포함)을 확인하세요. 10분간 유효합니다.')
+      window.setTimeout(() => inputRef.current?.focus(), 0)
+    } catch {
+      setError('네트워크 오류로 인증번호를 보내지 못했습니다.')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const verify = async () => {
+    if (busy || code.length !== 6) return
+    setBusy('verify')
+    setError(null)
+    try {
+      const res = await fetch(`${base}/otp/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code }),
+      })
+      const json = await res.json().catch(() => null)
+      if (res.ok) {
+        onVerified()
+        return
+      }
+      setError(json?.error ?? '인증에 실패했습니다. 다시 시도해 주세요.')
+      if (res.status === 410 || res.status === 429) {
+        // Code is no longer usable: a new one is needed.
+        setCode('')
+        setInfo(null)
+      } else {
+        inputRef.current?.select()
+      }
+    } catch {
+      setError('네트워크 오류로 확인하지 못했습니다. 다시 시도해 주세요.')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <>
+      <div className="fixed inset-0 z-40 bg-black/25" aria-hidden onClick={onClose} />
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="otp-sheet-title"
+        className="fixed inset-x-0 z-50 border-t border-[var(--line)] bg-white shadow-[0_-4px_24px_rgba(0,0,0,0.12)] sm:mx-auto sm:mb-4 sm:max-w-xl sm:rounded-xl sm:border"
+        style={{ bottom: kb }}
+      >
+        <form
+          className="flex flex-col gap-3 px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
+          onSubmit={(e) => {
+            e.preventDefault()
+            void verify()
+          }}
+        >
+          <div className="flex items-center justify-between">
+            <h2 id="otp-sheet-title" className="text-base font-semibold">
+              이메일 본인 확인
+            </h2>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="닫기"
+              className="-mr-2 inline-flex h-11 w-11 items-center justify-center rounded-md text-[var(--muted)] hover:bg-neutral-100"
+            >
+              <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden>
+                <path d="M4 4l10 10M14 4L4 14" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+              </svg>
+            </button>
+          </div>
+          <p className="text-sm leading-relaxed text-[var(--muted)]">
+            서명 전에 본인 확인이 필요합니다. <span className="font-medium text-[var(--fg)]">{emailMasked}</span>로 6자리 인증번호를
+            보내드립니다.
+          </p>
+          <div className="flex items-center gap-2">
+            <label htmlFor="otp-input" className="sr-only">
+              인증번호 6자리
+            </label>
+            <input
+              ref={inputRef}
+              id="otp-input"
+              type="text"
+              value={code}
+              onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              placeholder="인증번호 6자리"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              autoComplete="one-time-code"
+              enterKeyHint="done"
+              maxLength={6}
+              aria-invalid={!!error}
+              aria-describedby="otp-status"
+              className="min-h-12 min-w-0 flex-1 rounded-md border border-[var(--line)] bg-white px-3 text-[20px] tracking-[0.3em] tabular-nums text-[var(--fg)] outline-none placeholder:text-[16px] placeholder:tracking-normal focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]/30"
+            />
+            <button
+              type="button"
+              onClick={() => void send()}
+              disabled={busy !== null || cooldown > 0}
+              className={`${secondaryBtn} shrink-0 tabular-nums disabled:cursor-not-allowed disabled:opacity-50`}
+            >
+              {busy === 'send' ? '보내는 중...' : cooldown > 0 ? `재전송 ${cooldown}초` : sent ? '다시 받기' : '인증번호 받기'}
+            </button>
+          </div>
+          <div id="otp-status" aria-live="polite" className="min-h-5 text-sm">
+            {error ? <p className="text-red-700">{error}</p> : info ? <p className="text-[var(--muted)]">{info}</p> : null}
+          </div>
+          <button type="submit" disabled={busy !== null || code.length !== 6} className={`${primaryBtn} w-full`}>
+            {busy === 'verify' ? '확인 중...' : '확인'}
+          </button>
         </form>
       </div>
     </>

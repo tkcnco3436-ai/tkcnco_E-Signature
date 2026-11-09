@@ -6,9 +6,9 @@ import { PDFDocument, degrees, rgb, type PDFFont, type PDFImage, type PDFPage } 
 import fontkit from '@pdf-lib/fontkit'
 import forge from 'node-forge'
 import { pdflibAddPlaceholder } from '@signpdf/placeholder-pdf-lib'
-import { P12Signer } from '@signpdf/signer-p12'
-import { SignPdf } from '@signpdf/signpdf'
+import { SignPdf, Signer } from '@signpdf/signpdf'
 import { DATA_DIR, originalPdfPath } from './db'
+import { readTlv, requestTimestamp, tsaConfig } from './tsa'
 import { fieldFrame } from './pdf'
 import { kstDateTime } from './time'
 import type { DocumentBundle, EventType, SignerRow } from './types'
@@ -342,7 +342,8 @@ function drawAuditCertificate(
     w.cell('서명 시각', kstDateTime(s.signed_at), M + colW, labelW, colW - labelW - 6)
     w.y -= LH
     w.cell('IP 주소', s.ip ?? '-', M, labelW, colW - labelW - 6)
-    w.y -= LH
+    const otpH = w.cell('본인 확인', s.otp_verified_at ? `이메일 OTP 인증 (${kstDateTime(s.otp_verified_at)})` : '-', M + colW, labelW, colW - labelW - 6)
+    w.y -= Math.max(LH, otpH)
     w.cell('브라우저', s.user_agent ?? '-', M, labelW, innerW - labelW)
     w.y -= uaLines.length * LH
     w.y = Math.min(w.y, top - thumbH - 2) - 4
@@ -417,11 +418,107 @@ function drawAuditCertificate(
 // Main entry
 // ---------------------------------------------------------------------------
 
+const OID_SIGNATURE_TIME_STAMP_TOKEN = '1.2.840.113549.1.9.16.2.14' // id-aa-signatureTimeStampToken
+
+export interface SealResult {
+  bytes: Uint8Array
+  /** RFC 3161 signature timestamp embedded in the CMS (null when disabled or failed). */
+  timestamp: { at: Date; tsa: string } | null
+  /** Why the timestamp is missing although TSA_ENABLED (only when TSA_REQUIRED is off). */
+  timestampError?: string
+}
+
+/**
+ * Detached PKCS#7 signer (same CMS as @signpdf/signer-p12: sha256, signed attributes
+ * contentType / signingTime / messageDigest) that adds an RFC 3161 signature-time-stamp as an
+ * unsigned attribute of the SignerInfo, over SHA-256 of the signature value.
+ */
+class TimestampingP12Signer extends Signer {
+  timestamp: SealResult['timestamp'] = null
+  timestampError?: string
+
+  private p12: Buffer
+  private passphrase: string
+  private tsa: { enabled: boolean; required: boolean; url: string }
+
+  constructor(p12: Buffer, passphrase: string, tsa: { enabled: boolean; required: boolean; url: string }) {
+    super()
+    this.p12 = p12
+    this.passphrase = passphrase
+    this.tsa = tsa
+  }
+
+  async sign(pdfBuffer: Buffer, signingTime?: Date): Promise<Buffer> {
+    const p12 = forge.pkcs12.pkcs12FromAsn1(
+      forge.asn1.fromDer(forge.util.createBuffer(this.p12.toString('binary'))),
+      false,
+      this.passphrase,
+    )
+    const certBags = p12.getBags({ bagType: forge.pki.oids.certBag })[forge.pki.oids.certBag] ?? []
+    const keyBag = (p12.getBags({ bagType: forge.pki.oids.pkcs8ShroudedKeyBag })[forge.pki.oids.pkcs8ShroudedKeyBag] ?? [])[0]
+    const key = keyBag?.key as forge.pki.rsa.PrivateKey | undefined
+    if (!key) throw new Error('signing key not found in certificate file')
+    const p7 = forge.pkcs7.createSignedData()
+    p7.content = forge.util.createBuffer(pdfBuffer.toString('binary'))
+    let certificate: forge.pki.Certificate | undefined
+    for (const bag of certBags) {
+      if (!bag.cert) continue
+      p7.addCertificate(bag.cert)
+      const pub = bag.cert.publicKey as forge.pki.rsa.PublicKey
+      if (key.n.compareTo(pub.n) === 0 && key.e.compareTo(pub.e) === 0) certificate = bag.cert
+    }
+    if (!certificate) throw new Error('no certificate matches the signing key')
+    p7.addSigner({
+      key,
+      certificate,
+      digestAlgorithm: forge.pki.oids.sha256,
+      authenticatedAttributes: [
+        { type: forge.pki.oids.contentType, value: forge.pki.oids.data },
+        { type: forge.pki.oids.signingTime, value: (signingTime ?? new Date()) as unknown as string },
+        { type: forge.pki.oids.messageDigest },
+      ],
+    })
+    p7.sign({ detached: true })
+    const asn = p7.toAsn1()
+
+    if (this.tsa.enabled) {
+      try {
+        const a = forge.asn1
+        // ContentInfo -> [0] -> SignedData -> signerInfos (last) -> SignerInfo
+        const signedData = ((asn.value as forge.asn1.Asn1[])[1].value as forge.asn1.Asn1[])[0]
+        const sdParts = signedData.value as forge.asn1.Asn1[]
+        const signerInfo = (sdParts[sdParts.length - 1].value as forge.asn1.Asn1[])[0]
+        const siParts = signerInfo.value as forge.asn1.Asn1[]
+        const sigValue = siParts[siParts.length - 1]
+        if (sigValue.type !== a.Type.OCTETSTRING) throw new Error('unexpected SignerInfo layout')
+        const digest = crypto.createHash('sha256').update(Buffer.from(sigValue.value as string, 'binary')).digest()
+        const { token, genTime } = await requestTimestamp(digest, this.tsa.url)
+        // Embed the token bytes verbatim (never re-encode the TSA's signed structure): a node with
+        // constructed=false and type 0x30 makes forge write tag 0x30 + length + the raw content.
+        const t = readTlv(token)
+        const raw = a.create(a.Class.UNIVERSAL, 0x30 as forge.asn1.Type, false, token.subarray(t.contentStart).toString('binary'))
+        const attr = a.create(a.Class.UNIVERSAL, a.Type.SEQUENCE, true, [
+          a.create(a.Class.UNIVERSAL, a.Type.OID, false, a.oidToDer(OID_SIGNATURE_TIME_STAMP_TOKEN).getBytes()),
+          a.create(a.Class.UNIVERSAL, a.Type.SET, true, [raw]),
+        ])
+        siParts.push(a.create(a.Class.CONTEXT_SPECIFIC, 1, true, [attr])) // [1] IMPLICIT unsignedAttrs
+        this.timestamp = { at: genTime, tsa: this.tsa.url }
+      } catch (err) {
+        if (this.tsa.required) throw err
+        this.timestampError = err instanceof Error ? err.message : String(err)
+        console.warn('[seal] timestamp skipped:', this.timestampError)
+      }
+    }
+    return Buffer.from(forge.asn1.toDer(asn).getBytes(), 'binary')
+  }
+}
+
 /**
  * Builds the final sealed PDF: original pages + stamped field values + audit certificate page(s),
- * signed with a PAdES (adbe.pkcs7.detached) signature. Throws if any step (incl. signing) fails.
+ * signed with a PAdES (adbe.pkcs7.detached) signature carrying an RFC 3161 signature timestamp
+ * when TSA_ENABLED (default). Throws if any step fails, incl. the timestamp when TSA_REQUIRED.
  */
-export async function buildSealedPdf(bundle: DocumentBundle): Promise<Uint8Array> {
+export async function buildSealedPdf(bundle: DocumentBundle): Promise<SealResult> {
   const original = fs.readFileSync(originalPdfPath(bundle.document.id))
   const pdf = await PDFDocument.load(original, { updateMetadata: false })
   pdf.registerFontkit(fontkit)
@@ -462,10 +559,16 @@ export async function buildSealedPdf(bundle: DocumentBundle): Promise<Uint8Array
     contactInfo: process.env.OWNER_EMAIL || '',
     name: 'pdf-esign self-signed',
     location: process.env.APP_URL || 'pdf-esign',
-    signatureLength: 16384,
+    // Hex digits reserved for /Contents (= 16 KB of CMS): ~1.5 KB signature + the TSA token with
+    // its cert chain (DigiCert ≈ 6 KB, others up to ~10 KB). The old 16384 (8 KB) was too tight.
+    signatureLength: 32768,
   })
   const withPlaceholder = await pdf.save({ useObjectStreams: false })
-  const signer = new P12Signer(p12, { passphrase })
+  const signer = new TimestampingP12Signer(p12, passphrase, tsaConfig())
   const signed = await new SignPdf().sign(Buffer.from(withPlaceholder), signer)
-  return new Uint8Array(signed)
+  return {
+    bytes: new Uint8Array(signed),
+    timestamp: signer.timestamp,
+    ...(signer.timestampError ? { timestampError: signer.timestampError } : {}),
+  }
 }

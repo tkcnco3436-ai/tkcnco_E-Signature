@@ -85,7 +85,7 @@ export function resendNotification(documentId: string): Promise<{ signerId: stri
 export function signLink(token: string): string            // `${APP_URL}/sign/${token}`
 
 // lib/seal.ts
-export async function buildSealedPdf(bundle: DocumentBundle): Promise<Uint8Array>
+export async function buildSealedPdf(bundle: DocumentBundle): Promise<{ bytes: Uint8Array; timestamp: { at: Date; tsa: string } | null; timestampError?: string }>  // RFC 3161 via lib/tsa.ts
 ```
 Errors from workflow functions: throw `WorkflowError(message, status)` exported from `lib/workflow.ts`.
 

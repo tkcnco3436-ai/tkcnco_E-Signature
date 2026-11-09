@@ -185,3 +185,22 @@ ${button(downloadLink, '서명 완료본 내려받기')}
 서명본에는 감사 증명서 페이지와 위·변조 확인용 전자서명(PAdES)이 포함되어 있습니다.`
   return { subject, html, text }
 }
+
+/** Email OTP for the signer's identity check. `code` is 6 digits (generated server-side). */
+export function otpEmail(doc: DocumentRow, signer: SignerRow, code: string): MailTemplate {
+  const safeCode = code.replace(/\D/g, '').slice(0, 6)
+  const subject = oneLine(`[인증번호 ${safeCode}] ${doc.title}`)
+  const html = layout(`
+<h1 style="margin:0 0 16px 0;font-size:20px;">이메일 본인 확인</h1>
+<p style="margin:0 0 8px 0;">${escapeHtml(signer.name)}님, <strong>${escapeHtml(doc.title)}</strong> 문서 서명을 위한 인증번호입니다.</p>
+<p style="margin:20px 0;font-size:34px;font-weight:700;letter-spacing:8px;font-family:Consolas,Menlo,monospace;color:#1f2328;">${safeCode}</p>
+<p style="margin:0 0 8px 0;">서명 화면에 위 6자리 숫자를 입력하세요. 인증번호는 10분간 유효합니다.</p>
+<p style="margin:0 0 8px 0;font-size:13px;color:#57606a;">본인이 요청하지 않았다면 이 메일을 무시하세요.</p>`)
+  const text = `${signer.name}님, "${doc.title}" 문서 서명을 위한 인증번호입니다.
+
+인증번호: ${safeCode}
+
+서명 화면에 위 6자리 숫자를 입력하세요. 인증번호는 10분간 유효합니다.
+본인이 요청하지 않았다면 이 메일을 무시하세요.`
+  return { subject, html, text }
+}

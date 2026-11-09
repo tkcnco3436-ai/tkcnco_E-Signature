@@ -128,6 +128,11 @@ async function main() {
   const sent = await r.json()
   ok(r.ok, `send -> ${r.status} ${JSON.stringify(sent).slice(0, 120)}`)
 
+  // MAIL_DISABLED=1 without OTP_TEST_MODE: email OTP is skipped, signing works without it.
+  r = await fetch(`${BASE}/api/sign/${owner.token}`)
+  const view0 = await r.json()
+  ok(r.ok && view0.otp?.required === false, `GET sign view: otp.required === false with MAIL_DISABLED (${JSON.stringify(view0.otp)})`)
+
   // CSRF: a state-changing admin call with a foreign Origin is refused even with a valid cookie
   r = await fetch(`${BASE}/api/admin/documents/${id}/resend`, { method: 'POST', headers: { ...H, origin: 'https://evil.example' } })
   ok(r.status === 403, `cross-origin admin POST -> 403 (${r.status})`)

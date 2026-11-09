@@ -15,5 +15,8 @@ if (stress) {
   const ev = [...b.events]
   for (let i = 0; i < 3; i++) b.events.push(...ev.slice(1))
 }
-fs.writeFileSync(out, await buildSealedPdf(b))
+const sealed = await buildSealedPdf(b)
+fs.writeFileSync(out, sealed.bytes)
 console.log('wrote', out)
+if (sealed.timestamp) console.log('timestamp', sealed.timestamp.at.toISOString(), 'from', sealed.timestamp.tsa)
+else console.log('no timestamp', sealed.timestampError ?? '(TSA disabled)')

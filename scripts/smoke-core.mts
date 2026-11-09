@@ -14,7 +14,14 @@ process.env.DATA_DIR = dataDir
 process.env.APP_URL = 'https://esign.example.test'
 delete process.env.RESEND_API_KEY
 process.env.MAIL_DISABLED = '1' // never send real mail from tests
+// RFC 3161: the main document is timestamped by the real TSA (TSA_URL, default DigiCert) unless
+// SMOKE_TSA=0. A network failure there is tolerated (logged as timestamp_failed); later documents
+// run with TSA_ENABLED=0, and TSA_REQUIRED is tested against an unreachable TSA.
+process.env.TSA_ENABLED = process.env.SMOKE_TSA === '0' ? '0' : '1'
+process.env.TSA_REQUIRED = '0'
 delete process.env.TRUST_PROXY
+delete process.env.SIGN_OTP
+delete process.env.OTP_TEST_MODE
 
 const { PDFDocument, StandardFonts, degrees, decodePDFRawStream, PDFRawStream, PDFName, PDFDict } = await import('pdf-lib')
 const forge = (await import('node-forge')).default
@@ -301,6 +308,26 @@ if (process.env.OUT) {
 
 verifyPades(signedFile)
 log('PAdES: ByteRange covers file, messageDigest matches, RSA signature verifies with embedded cert')
+{
+  const { verifySealed } = await import('./verify-sealed.mts')
+  const report = verifySealed(signedFile)
+  const evTypes = final.events.map((e) => e.type)
+  if (final.document.timestamp_at) {
+    assert.ok(report.timestamp, 'timestamp_at set but no token in the CMS')
+    assert.equal(report.timestamp.genTime.toISOString(), final.document.timestamp_at)
+    assert.equal(final.document.timestamp_tsa, process.env.TSA_URL || 'http://timestamp.digicert.com')
+    assert.ok(evTypes.includes('timestamped') && !evTypes.includes('timestamp_failed'))
+    log(`RFC 3161 timestamp ${final.document.timestamp_at} (token ${report.timestamp.tokenBytes} B, TSA ${report.timestamp.tsaSubject})`)
+  } else {
+    assert.equal(report.timestamp, null)
+    assert.equal(final.document.timestamp_tsa, null)
+    if (process.env.TSA_ENABLED === '1') {
+      assert.ok(evTypes.includes('timestamp_failed'), 'TSA failure must be logged')
+      console.log('  ! TSA unreachable, sealed without timestamp:', final.events.find((e) => e.type === 'timestamp_failed')?.detail)
+    }
+  }
+}
+process.env.TSA_ENABLED = '0' // no more network calls below
 
 await checkEmbeddedFont(signedFile)
 
@@ -419,6 +446,33 @@ log('resendNotification(completed) -> completion mail to all signers with fresh 
   log('concurrent finalize: single completed event, hash matches file, no temp files; completed doc deletable')
 }
 
+// TSA_REQUIRED: an unreachable TSA makes sealing fail (document stays sent); the admin retry seals.
+{
+  Object.assign(process.env, { TSA_ENABLED: '1', TSA_REQUIRED: '1', TSA_URL: 'http://127.0.0.1:9/tsr' })
+  const d4 = await wf.createDocument({ title: 'tsa required', pdf: pdfBytes })
+  const b4 = wf.saveDraft(d4.id, {
+    signers: [{ name: '김태경', email: 'owner@example.com', is_owner: true, order_index: 0 }],
+    fields: [{ signer_ref: 0, page: 1, x: 0.1, y: 0.1, w: 0.3, h: 0.08, type: 'signature' }],
+  })
+  await wf.sendDocument(d4.id)
+  const r4 = await wf.submitSignature(b4.signers[0].token, { signaturePng: sig, values: {}, consent: true }, info)
+  await wf.flushBackgroundTasks()
+  assert.equal(r4.completed, false)
+  assert.equal(dbm.getDocument(d4.id)!.status, 'sent')
+  assert.ok(!fs.existsSync(dbm.signedPdfPath(d4.id)))
+  Object.assign(process.env, { TSA_ENABLED: '0', TSA_REQUIRED: '0' })
+  delete process.env.TSA_URL
+  assert.deepEqual(await wf.resendNotification(d4.id), [])
+  await wf.flushBackgroundTasks()
+  const done4 = dbm.getBundle(d4.id)!
+  assert.equal(done4.document.status, 'completed')
+  assert.equal(done4.document.timestamp_at, null)
+  assert.ok(!done4.events.some((e) => e.type === 'timestamped' || e.type === 'timestamp_failed'))
+  const { verifySealed } = await import('./verify-sealed.mts')
+  assert.equal(verifySealed(fs.readFileSync(dbm.signedPdfPath(d4.id))).timestamp, null)
+  log('TSA_REQUIRED + unreachable TSA -> sealing fails, stays sent; retry with TSA_ENABLED=0 seals without timestamp')
+}
+
 // Void/delete guards
 await expectWorkflowError(() => wf.voidDocument(doc.id), 409)
 const doc2 = await wf.createDocument({ title: 'to delete', pdf: pdfBytes })
@@ -428,6 +482,136 @@ wf.deleteDocument(doc2.id)
 assert.equal(dbm.getDocument(doc2.id), undefined)
 assert.ok(!fs.existsSync(dbm.docDir(doc2.id)))
 log('void/delete')
+
+// Email OTP identity check
+{
+  const otp = await import('../lib/otp.ts')
+  async function expectOtpError(p: Promise<unknown> | (() => unknown), status: number) {
+    try {
+      await (typeof p === 'function' ? p() : p)
+    } catch (e) {
+      assert.ok(e instanceof otp.OtpError, `expected OtpError, got ${String(e)}`)
+      assert.equal(e.status, status, e.message)
+      return e
+    }
+    assert.fail(`expected OtpError ${status}`)
+  }
+
+  // Skipped: MAIL_DISABLED without OTP_TEST_MODE, SIGN_OTP=off, or mail not configured.
+  assert.equal(otp.otpRequired(), false, 'MAIL_DISABLED without OTP_TEST_MODE must skip OTP')
+  assert.throws(() => otp.__otpTestPeek('x'), /OTP_TEST_MODE/)
+  process.env.RESEND_API_KEY = 're_dummy_never_used'
+  process.env.MAIL_FROM = 'Test <noreply@example.test>'
+  assert.equal(otp.otpRequired(), false, 'MAIL_DISABLED wins over configured mail')
+  delete process.env.MAIL_DISABLED // only otpRequired() runs here; nothing is sent
+  try {
+    assert.equal(otp.otpRequired(), true, 'mail configured -> OTP required')
+    process.env.SIGN_OTP = 'off'
+    assert.equal(otp.otpRequired(), false, 'SIGN_OTP=off')
+    delete process.env.SIGN_OTP
+    delete process.env.MAIL_FROM
+    assert.equal(otp.otpRequired(), false, 'no MAIL_FROM -> mail not configured -> skipped')
+  } finally {
+    process.env.MAIL_DISABLED = '1'
+    delete process.env.RESEND_API_KEY
+    delete process.env.MAIL_FROM
+    delete process.env.SIGN_OTP
+  }
+  assert.equal(otp.maskEmail('hl0713@tkcnco.com'), 'hl****@tkcnco.com')
+  assert.equal(otp.maskEmail('a@b.co'), 'a****@b.co')
+  log('OTP skipped without mail / SIGN_OTP=off / MAIL_DISABLED; required with mail configured; email masking')
+
+  process.env.OTP_TEST_MODE = '1'
+  process.env.SESSION_SECRET = 's'.repeat(40)
+  assert.equal(otp.otpRequired(), true)
+  const d4 = await wf.createDocument({ title: 'otp test', pdf: pdfBytes })
+  const b4 = wf.saveDraft(d4.id, {
+    signers: [{ name: '이몽룡', email: 'lee@example.com', is_owner: false, order_index: 0 }],
+    fields: [{ signer_ref: 0, page: 1, x: 0.1, y: 0.1, w: 0.3, h: 0.08, type: 'signature' }],
+  })
+  const s4 = b4.signers[0]
+  const t4 = s4.token
+  await expectWorkflowError(wf.requestSignerOtp(t4, info), 409)
+  log('OTP send refused before the document is sent (409)')
+  await wf.sendDocument(d4.id)
+  const signer4 = () => dbm.getSigners(d4.id)[0]
+  const sign4 = () => wf.submitSignature(t4, { signaturePng: sig, values: {}, consent: true }, info)
+  const setSigner = (sql: string, ...args: (string | null)[]) => dbm.db().prepare(`UPDATE signers SET ${sql} WHERE id = ?`).run(...args, s4.id)
+  const pastIso = (ms: number) => new Date(Date.now() - ms).toISOString()
+
+  assert.deepEqual(otp.otpStatus(signer4()), { required: true, verified: false, email_masked: 'le****@example.com' })
+  assert.equal(await expectWorkflowError(sign4(), 403), '이메일 인증이 필요합니다.')
+  log('sign blocked without OTP (403)')
+
+  await expectOtpError(() => wf.verifySignerOtp(t4, '123456', info), 410)
+  const sent1 = await wf.requestSignerOtp(t4, info)
+  assert.deepEqual(sent1, { expires_in: 600, resend_in: 60 })
+  assert.ok(!JSON.stringify(sent1).match(/\d{6}/), 'code never returned')
+  const cd = await expectOtpError(wf.requestSignerOtp(t4, info), 429)
+  assert.ok(cd.retryAfter! >= 1 && cd.retryAfter! <= 60, `retryAfter ${cd.retryAfter}`)
+  log(`resend cooldown 429 (retry after ${cd.retryAfter}s)`)
+
+  let code = otp.__otpTestPeek(s4.id)!
+  assert.match(code, /^\d{6}$/)
+  assert.notEqual(signer4().otp_hash, code)
+  const wrong = (c: string) => String((Number(c) + 1) % 1_000_000).padStart(6, '0')
+  const w1 = await expectOtpError(() => wf.verifySignerOtp(t4, wrong(code), info), 400)
+  assert.equal(w1.remaining, 4)
+  assert.equal(signer4().otp_attempts, 1)
+  await expectOtpError(() => wf.verifySignerOtp(t4, '12ab', info), 400)
+  assert.equal(signer4().otp_attempts, 1, 'malformed code does not use an attempt')
+  for (const left of [3, 2, 1]) assert.equal((await expectOtpError(() => wf.verifySignerOtp(t4, wrong(code), info), 400)).remaining, left)
+  const w5 = await expectOtpError(() => wf.verifySignerOtp(t4, wrong(code), info), 429)
+  assert.equal(w5.remaining, 0)
+  assert.equal(signer4().otp_hash, null)
+  await expectOtpError(() => wf.verifySignerOtp(t4, code, info), 429) // correct code no longer works
+  assert.equal(dbm.getEvents(d4.id).filter((e) => e.type === 'otp_failed').length, 5)
+  log('wrong code decrements remaining attempts; 5 wrong -> code invalidated (429), correct code then rejected')
+
+  setSigner('otp_sent_at = ?', pastIso(61_000))
+  await wf.requestSignerOtp(t4, info)
+  assert.equal(signer4().otp_attempts, 0)
+  code = otp.__otpTestPeek(s4.id)!
+  setSigner('otp_expires_at = ?', pastIso(1000))
+  await expectOtpError(() => wf.verifySignerOtp(t4, code, info), 410)
+  log('expired code -> 410')
+
+  for (let i = 0; i < 3; i++) {
+    setSigner('otp_sent_at = ?', pastIso(61_000))
+    await wf.requestSignerOtp(t4, info) // sends #3..#5 within the hour
+  }
+  setSigner('otp_sent_at = ?', pastIso(61_000))
+  const lim = await expectOtpError(wf.requestSignerOtp(t4, info), 429)
+  assert.match(lim.message, /횟수/)
+  assert.equal(dbm.getEvents(d4.id).filter((e) => e.type === 'otp_sent').length, 5)
+  log('max 5 sends per hour -> 429')
+
+  code = otp.__otpTestPeek(s4.id)!
+  const ok = wf.verifySignerOtp(t4, code, { ip: '192.0.2.9', userAgent: 'otp-ua' })
+  assert.ok(ok.verified_at)
+  assert.equal(signer4().otp_hash, null)
+  assert.equal(otp.otpStatus(signer4()).verified, true)
+  const ev = dbm.getEvents(d4.id).find((e) => e.type === 'otp_verified')!
+  assert.equal(ev.ip, '192.0.2.9')
+  assert.equal(ev.user_agent, 'otp-ua')
+  // Verification older than 30 minutes no longer counts.
+  setSigner('otp_verified_at = ?', pastIso(31 * 60_000))
+  await expectWorkflowError(sign4(), 403)
+  setSigner('otp_verified_at = ?', ok.verified_at)
+  const r4 = await sign4()
+  assert.equal(r4.completed, true)
+  await wf.flushBackgroundTasks()
+  const pdfjs4 = await import('pdfjs-dist/legacy/build/pdf.mjs')
+  const sealed4 = await pdfjs4.getDocument({ data: new Uint8Array(fs.readFileSync(dbm.signedPdfPath(d4.id))), isEvalSupported: false }).promise
+  let audit4 = ''
+  for (let n = 1; n <= sealed4.numPages; n++)
+    audit4 += (await (await sealed4.getPage(n)).getTextContent()).items.map((i) => ('str' in i ? i.str : '')).join('')
+  assert.ok(audit4.includes('이메일 OTP 인증'), 'audit page missing OTP row')
+  log('verify ok -> sign ok (30 min window enforced); audit certificate shows 이메일 OTP 인증')
+
+  delete process.env.OTP_TEST_MODE
+  assert.throws(() => otp.__otpTestPeek(s4.id))
+}
 
 dbm.db().close()
 if (!process.env.KEEP) fs.rmSync(dataDir, { recursive: true, force: true })
