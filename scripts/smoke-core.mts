@@ -289,7 +289,8 @@ assert.equal(signedFile.subarray(0, 5).toString('latin1'), '%PDF-')
 assert.ok(signedFile.includes('/ByteRange'), 'missing /ByteRange')
 assert.ok(signedFile.includes('/adbe.pkcs7.detached'), 'missing SubFilter')
 const reopened = await PDFDocument.load(signedFile, { updateMetadata: false })
-assert.equal(reopened.getPageCount(), doc.page_count + 1, 'expected original pages + 1 audit page')
+// Audit certificate paginates (1+ pages) as the event log grows.
+assert.ok(reopened.getPageCount() >= doc.page_count + 1, 'expected original pages + audit page(s)')
 assert.ok(final.events.filter((e) => e.type === 'email_failed').length >= 3) // next-signer + 2 completion mails
 log(`completed: ${signedFile.length} bytes, ${reopened.getPageCount()} pages, sha256 ${final.document.signed_sha256}`)
 
@@ -396,10 +397,10 @@ log('resendNotification(completed) -> completion mail to all signers with fresh 
   await expectWorkflowError(() => wf.deleteDocument(d3.id), 409)
   log('deleteDocument refuses a sent document (409)')
   await wf.submitSignature(b3.signers[0].token, { signaturePng: sig, values: {}, consent: true }, info)
-  const ev = dbm.getEvents(d3.id).find((e) => e.detail?.includes('서명 차례 알림(관리자) → owner@example.com'))
-  assert.ok(ev, 'owner turn notification missing')
-  assert.ok(!ev.detail!.includes(b3.signers[1].token))
-  log('owner (2nd) notified by email with admin link')
+  // Approval line: the owner (2nd) gets the same sign-request email once signer 1 is done.
+  const ev = dbm.getEvents(d3.id).find((e) => e.signer_id === b3.signers[1].id && e.detail?.includes('서명 요청 → owner@example.com'))
+  assert.ok(ev, 'owner sign request missing')
+  log('owner (2nd) gets sign-request email when their turn comes')
   // Concurrent finalize attempts: only one sealing, one completed event.
   const signing = wf.submitSignature(b3.signers[1].token, { signaturePng: sig, values: {}, consent: true }, info)
   while (dbm.getSigners(d3.id).some((s) => s.status !== 'signed')) await new Promise((r) => setImmediate(r))

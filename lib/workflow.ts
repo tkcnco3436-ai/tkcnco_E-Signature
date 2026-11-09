@@ -19,7 +19,7 @@ import {
   signedPdfPath,
   tx,
 } from './db'
-import { completedEmail, ownerTurnEmail, sealFailedEmail, sendMail, signRequestEmail } from './mail'
+import { completedEmail, sealFailedEmail, sendMail, signRequestEmail } from './mail'
 import { PdfValidationError, validatePdf } from './pdf'
 import { buildSealedPdf } from './seal'
 import { kstDate } from './time'
@@ -260,28 +260,14 @@ export function saveDraft(
 // ---------------------------------------------------------------------------
 
 /**
- * Tells `signer` it is their turn. External signers get a sign link by email.
- * The owner signs from the admin UI: no email at send time (they are at the UI), but when
- * `emailOwner` is set (their turn came after someone else signed, or a resend) they get an
- * email with the admin page link (never a token link).
+ * Tells `signer` it is their turn by emailing a sign link. Approval-line behavior:
+ * every signer, the owner included, gets the request email only when their turn comes
+ * (send for the first, then after each signature for the next).
  */
-async function notifySigner(doc: DocumentRow, signer: SignerRow, opts: { emailOwner?: boolean } = {}): Promise<Notified> {
+async function notifySigner(doc: DocumentRow, signer: SignerRow, _opts: { emailOwner?: boolean } = {}): Promise<Notified> {
   const link = signLink(signer.token)
   if (signer.status === 'pending') {
     db().prepare("UPDATE signers SET status = 'sent' WHERE id = ? AND status = 'pending'").run(signer.id)
-  }
-  if (signer.is_owner) {
-    if (!opts.emailOwner) return { signerId: signer.id, link, emailed: false }
-    const to = ownerEmail([signer])
-    if (!to) return { signerId: signer.id, link, emailed: false }
-    const r = await sendMail({ to, ...ownerTurnEmail(doc, signer, adminLink(doc.id)) })
-    logEvent({
-      document_id: doc.id,
-      signer_id: signer.id,
-      type: r.ok ? 'email_sent' : 'email_failed',
-      detail: r.ok ? `서명 차례 알림(관리자) → ${to}` : `서명 차례 알림(관리자) → ${to}: ${r.error ?? 'unknown error'}`,
-    })
-    return { signerId: signer.id, link, emailed: r.ok }
   }
   const mail = signRequestEmail(doc, signer, link)
   const r = await sendMail({ to: signer.email, ...mail })
