@@ -121,6 +121,8 @@ export async function createDocument(input: {
     created_at: nowIso(),
     sent_at: null,
     completed_at: null,
+    timestamp_at: null,
+    timestamp_tsa: null,
   }
   try {
     tx(() => {

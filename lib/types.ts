@@ -15,6 +15,9 @@ export interface DocumentRow {
   created_at: string // ISO 8601
   sent_at: string | null
   completed_at: string | null
+  // RFC 3161 signature timestamp embedded in the PAdES signature (null when none / failed)
+  timestamp_at: string | null // genTime from the TSA token, ISO 8601
+  timestamp_tsa: string | null // TSA URL used
 }
 
 export interface SignerRow {
@@ -30,6 +33,12 @@ export interface SignerRow {
   signed_at: string | null
   ip: string | null
   user_agent: string | null
+  // Email OTP identity check
+  otp_hash: string | null // HMAC of the current code (never the code itself)
+  otp_expires_at: string | null
+  otp_attempts: number // failed attempts for the current code
+  otp_sent_at: string | null // last send time (resend cooldown)
+  otp_verified_at: string | null // set when the signer proved control of the email
 }
 
 // Coordinates are normalized to the page: 0..1, origin TOP-LEFT (browser convention).
@@ -57,6 +66,11 @@ export type EventType =
   | 'signed'
   | 'completed'
   | 'voided'
+  | 'otp_sent'
+  | 'otp_verified'
+  | 'otp_failed'
+  | 'timestamped'
+  | 'timestamp_failed'
 
 export interface EventRow {
   id: string

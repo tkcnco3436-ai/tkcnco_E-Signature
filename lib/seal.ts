@@ -171,6 +171,11 @@ const EVENT_LABEL: Record<EventType, string> = {
   signed: '서명',
   completed: '완료',
   voided: '무효',
+  otp_sent: '인증번호 발송',
+  otp_verified: '본인 확인',
+  otp_failed: '인증 실패',
+  timestamped: '타임스탬프',
+  timestamp_failed: '타임스탬프 실패',
 }
 
 // Compact audit certificate. Korean labels only, small type, two-column document info,

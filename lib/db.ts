@@ -67,6 +67,18 @@ function open(): DatabaseSync {
     CREATE INDEX IF NOT EXISTS idx_fields_doc ON fields(document_id);
     CREATE INDEX IF NOT EXISTS idx_events_doc ON events(document_id);
   `)
+  // Additive migrations for databases created by earlier versions.
+  const addColumn = (table: string, col: string, decl: string) => {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
+    if (!cols.some((c) => c.name === col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${decl}`)
+  }
+  addColumn('documents', 'timestamp_at', 'TEXT')
+  addColumn('documents', 'timestamp_tsa', 'TEXT')
+  addColumn('signers', 'otp_hash', 'TEXT')
+  addColumn('signers', 'otp_expires_at', 'TEXT')
+  addColumn('signers', 'otp_attempts', 'INTEGER NOT NULL DEFAULT 0')
+  addColumn('signers', 'otp_sent_at', 'TEXT')
+  addColumn('signers', 'otp_verified_at', 'TEXT')
   return db
 }
 

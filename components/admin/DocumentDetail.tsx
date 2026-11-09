@@ -30,6 +30,11 @@ const EVENT_LABEL: Record<EventType, string> = {
   signed: '서명',
   completed: '서명 완료 및 날인본 생성',
   voided: '무효 처리',
+  otp_sent: '인증번호 발송',
+  otp_verified: '이메일 본인 확인',
+  otp_failed: '인증번호 오류',
+  timestamped: '공인 타임스탬프',
+  timestamp_failed: '타임스탬프 실패',
 }
 
 async function copyText(text: string): Promise<boolean> {
