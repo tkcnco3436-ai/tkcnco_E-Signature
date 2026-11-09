@@ -182,7 +182,7 @@ assert.equal(doc.status, 'draft')
 log('createDocument', doc.id)
 
 const signers = [
-  { name: '김태경', email: 'owner@example.com', is_owner: true, order_index: 0 },
+  { name: '홍길동', email: 'owner@example.com', is_owner: true, order_index: 0 },
   { name: '홍길동', email: 'hong@example.com', is_owner: false, order_index: 1 },
 ]
 const fields = [
@@ -270,7 +270,7 @@ await expectWorkflowError(wf.submitSignature(owner.token, { signaturePng: sig, v
 const afterOwner = dbm.getBundle(doc.id)!
 const ownerDate = afterOwner.fields.find((f) => f.signer_id === owner.id && f.type === 'date')!
 assert.match(ownerDate.value ?? '', /^\d{4}-\d{2}-\d{2}$/)
-assert.equal(afterOwner.fields.find((f) => f.signer_id === owner.id && f.type === 'name')!.value, '김태경')
+assert.equal(afterOwner.fields.find((f) => f.signer_id === owner.id && f.type === 'name')!.value, '홍길동')
 assert.ok(afterOwner.events.some((e) => e.type === 'email_failed' && e.signer_id === ext.id))
 log('owner signed (date auto-filled', ownerDate.value + '), next signer notified (email_failed logged, no key)')
 
@@ -340,7 +340,7 @@ const t1 = await pageText(1)
 const t2 = await pageText(2)
 const t3 = await pageText(3)
 assert.ok(t1.includes('태경씨앤코 주식회사'), 'page 1 missing stamped Korean text: ' + t1)
-assert.ok(t1.includes('김태경'), 'page 1 missing owner name')
+assert.ok(t1.includes('홍길동'), 'page 1 missing owner name')
 assert.ok(t2.includes('홍길동'), 'page 2 (rotated) missing name')
 for (const needle of ['전자서명 감사 증명서', doc.id, doc.original_sha256, '홍길동', 'hong@example.com', '198.51.100.23', 'PAdES'])
   assert.ok(t3.includes(needle), `audit page missing "${needle}"`)
@@ -413,7 +413,7 @@ log('resendNotification(completed) -> completion mail to all signers with fresh 
   const b3 = wf.saveDraft(d3.id, {
     signers: [
       { name: '홍길동', email: 'hong@example.com', is_owner: false, order_index: 0 },
-      { name: '김태경', email: 'owner@example.com', is_owner: true, order_index: 1 },
+      { name: '홍길동', email: 'owner@example.com', is_owner: true, order_index: 1 },
     ],
     fields: [
       { signer_ref: 0, page: 1, x: 0.1, y: 0.1, w: 0.3, h: 0.08, type: 'signature' },
@@ -451,7 +451,7 @@ log('resendNotification(completed) -> completion mail to all signers with fresh 
   Object.assign(process.env, { TSA_ENABLED: '1', TSA_REQUIRED: '1', TSA_URL: 'http://127.0.0.1:9/tsr' })
   const d4 = await wf.createDocument({ title: 'tsa required', pdf: pdfBytes })
   const b4 = wf.saveDraft(d4.id, {
-    signers: [{ name: '김태경', email: 'owner@example.com', is_owner: true, order_index: 0 }],
+    signers: [{ name: '홍길동', email: 'owner@example.com', is_owner: true, order_index: 0 }],
     fields: [{ signer_ref: 0, page: 1, x: 0.1, y: 0.1, w: 0.3, h: 0.08, type: 'signature' }],
   })
   await wf.sendDocument(d4.id)
@@ -517,7 +517,7 @@ log('void/delete')
     delete process.env.MAIL_FROM
     delete process.env.SIGN_OTP
   }
-  assert.equal(otp.maskEmail('hl0713@tkcnco.com'), 'hl****@tkcnco.com')
+  assert.equal(otp.maskEmail('owner@example.com'), 'ow****@example.com')
   assert.equal(otp.maskEmail('a@b.co'), 'a****@b.co')
   log('OTP skipped without mail / SIGN_OTP=off / MAIL_DISABLED; required with mail configured; email masking')
 

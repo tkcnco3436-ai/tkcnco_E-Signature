@@ -56,7 +56,7 @@ export function otpRequired(): boolean {
   return mailConfigured() || otpTestMode()
 }
 
-/** `hl****@tkcnco.com`: first 2 characters of the local part, the rest masked. */
+/** `ow****@example.com`: first 2 characters of the local part, the rest masked. */
 export function maskEmail(email: string): string {
   const at = email.lastIndexOf('@')
   if (at < 1) return '****'

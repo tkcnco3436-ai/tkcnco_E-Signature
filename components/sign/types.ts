@@ -27,7 +27,7 @@ export interface SignViewResponse {
   reason: string | null
   progress: { signed: number; total: number }
   // Email OTP identity check. required=false when SIGN_OTP=off or mail is not configured (then signing works without it).
-  // verified: a code was confirmed within the last 30 minutes. email_masked: e.g. "hl****@tkcnco.com".
+  // verified: a code was confirmed within the last 30 minutes. email_masked: e.g. "ow****@example.com".
   otp: { required: boolean; verified: boolean; email_masked: string }
 }
 
