@@ -1,4 +1,4 @@
-﻿import 'server-only'
+import 'server-only'
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
@@ -163,21 +163,26 @@ function stampText(page: PDFPage, box: { x: number; y: number; w: number; h: num
 // ---------------------------------------------------------------------------
 
 const EVENT_LABEL: Record<EventType, string> = {
-  created: '생성 Created',
-  sent: '발송 Sent',
-  email_sent: '메일 발송 Email sent',
-  email_failed: '메일 실패 Email failed',
-  viewed: '열람 Viewed',
-  signed: '서명 Signed',
-  completed: '완료 Completed',
-  voided: '무효 Voided',
+  created: '생성',
+  sent: '발송',
+  email_sent: '메일 발송',
+  email_failed: '메일 실패',
+  viewed: '열람',
+  signed: '서명',
+  completed: '완료',
+  voided: '무효',
 }
 
+// Compact audit certificate. Korean labels only, small type, two-column document info,
+// one block per signer. Fits on one A4 page for typical contracts (≈6 signers / 40 events);
+// paginates automatically beyond that.
 const A4: [number, number] = [595.28, 841.89]
-const M = 44 // margin
+const M = 36 // margin
 const INK = rgb(0.1, 0.1, 0.12)
 const MUTED = rgb(0.42, 0.45, 0.5)
 const RULE = rgb(0.82, 0.84, 0.87)
+const BODY = 7.5 // body text size
+const LH = 10 // body line height
 
 class AuditWriter {
   doc: PDFDocument
@@ -208,50 +213,70 @@ class AuditWriter {
   }
 
   ensure(h: number) {
-    if (this.y - h < M + 14) this.newPage()
+    if (this.y - h < M + 12) this.newPage()
   }
 
   text(s: string, x: number, size: number, color = INK) {
     this.page.drawText(s, { x, y: this.y - size, size, font: this.font, color })
   }
 
-  heading(ko: string, en: string) {
-    this.ensure(40)
-    this.y -= 10
-    this.text(ko, M, 12)
-    const w = this.font.widthOfTextAtSize(ko, 12)
-    this.text(en, M + w + 6, 9, MUTED)
-    this.y -= 18
-    this.page.drawLine({ start: { x: M, y: this.y }, end: { x: M + this.width, y: this.y }, thickness: 0.7, color: RULE })
-    this.y -= 6
+  rule(thickness = 0.4) {
+    this.page.drawLine({ start: { x: M, y: this.y }, end: { x: M + this.width, y: this.y }, thickness, color: RULE })
   }
 
-  /** Label/value rows with wrapped values; returns nothing, advances the cursor. */
-  rows(rows: [string, string][], labelW: number, size: number, valueW: number) {
-    const lh = size * 1.45
-    for (const [label, value] of rows) {
-      const lines = wrap(this.font, value || '-', size, valueW)
-      this.ensure(lines.length * lh + 2)
-      this.text(label, M, size, MUTED)
-      for (const l of lines) {
-        this.text(l, M + labelW, size)
-        this.y -= lh
+  heading(title: string) {
+    this.ensure(28)
+    this.y -= 8
+    this.text(title, M, 9.5)
+    this.y -= 13
+    this.rule(0.7)
+    this.y -= 4
+  }
+
+  /** One label/value cell with wrapped value. Returns the height used. Does not move the cursor. */
+  cell(label: string, value: string, x: number, labelW: number, valueW: number): number {
+    const lines = wrap(this.font, value || '-', BODY, valueW)
+    this.page.drawText(label, { x, y: this.y - BODY, size: BODY, font: this.font, color: MUTED })
+    lines.forEach((l, i) => {
+      this.page.drawText(l, { x: x + labelW, y: this.y - BODY - i * LH, size: BODY, font: this.font, color: INK })
+    })
+    return lines.length * LH
+  }
+
+  /** Rows of up to two label/value pairs side by side. A pair with `full` spans the whole width. */
+  grid(rows: ([string, string] | [string, string, 'full'])[]) {
+    const labelW = 52
+    const colW = this.width / 2
+    let i = 0
+    while (i < rows.length) {
+      const a = rows[i]
+      const b = rows[i + 1]
+      if (a[2] === 'full' || !b || b[2] === 'full') {
+        const h = wrap(this.font, a[1] || '-', BODY, this.width - labelW).length * LH
+        this.ensure(h + 2)
+        this.cell(a[0], a[1], M, labelW, this.width - labelW)
+        this.y -= h + 2
+        i += 1
+      } else {
+        const valueW = colW - labelW - 8
+        const h = Math.max(
+          wrap(this.font, a[1] || '-', BODY, valueW).length,
+          wrap(this.font, b[1] || '-', BODY, valueW).length,
+        ) * LH
+        this.ensure(h + 2)
+        this.cell(a[0], a[1], M, labelW, valueW)
+        this.cell(b[0], b[1], M + colW, labelW, valueW)
+        this.y -= h + 2
+        i += 2
       }
-      this.y -= 2
     }
-  }
-
-  measureRows(rows: [string, string][], size: number, valueW: number): number {
-    let h = 0
-    for (const [, v] of rows) h += wrap(this.font, v || '-', size, valueW).length * size * 1.45 + 2
-    return h
   }
 
   footer(docId: string) {
     const total = this.pages.length
     this.pages.forEach((p, i) => {
-      const s = `pdf-esign · Audit Certificate · ${docId} · ${i + 1}/${total}`
-      p.drawText(s, { x: M, y: M - 18, size: 7, font: this.font, color: MUTED })
+      const s = `전자서명 감사 증명서 · ${docId} · ${i + 1}/${total}`
+      p.drawText(s, { x: M, y: M - 16, size: 6.5, font: this.font, color: MUTED })
     })
   }
 }
@@ -265,94 +290,92 @@ function drawAuditCertificate(
   const { document: d, signers, events } = bundle
   const w = new AuditWriter(out, font)
 
-  // Title
-  w.text('전자서명 감사 증명서', M, 20)
-  w.y -= 26
-  w.text('Certificate of Completion / Audit Trail', M, 10, MUTED)
+  // Title line
+  w.text('전자서명 감사 증명서', M, 15)
+  const tw = font.widthOfTextAtSize('전자서명 감사 증명서', 15)
+  w.text('Audit Trail', M + tw + 8, 8, MUTED)
   w.y -= 22
 
-  w.heading('문서 정보', 'Document')
-  w.rows(
-    [
-      ['문서 제목 / Title', d.title],
-      ['문서 ID / Document ID', d.id],
-      ['원본 SHA-256 / Original hash', d.original_sha256],
-      ['원본 페이지 수 / Pages', String(d.page_count)],
-      ['생성 / Created', kstDateTime(d.created_at)],
-      ['발송 / Sent', kstDateTime(d.sent_at)],
-      ['완료 / Completed', kstDateTime(d.completed_at)],
-      ['상태 / Status', d.status],
-    ],
-    150,
-    9,
-    w.width - 150,
-  )
+  w.heading('문서 정보')
+  w.grid([
+    ['문서 제목', d.title, 'full'],
+    ['문서 ID', d.id],
+    ['원본 페이지', `${d.page_count}쪽`],
+    ['원본 SHA-256', d.original_sha256, 'full'],
+    ['생성', kstDateTime(d.created_at)],
+    ['발송', kstDateTime(d.sent_at)],
+    ['완료', kstDateTime(d.completed_at)],
+    ['서명자 수', `${signers.length}명`],
+  ])
 
-  w.heading('서명자', 'Signers')
-  const thumbW = 120
-  const thumbH = 48
-  const labelW = 110
-  const valueW = w.width - labelW - thumbW - 12
+  w.heading('서명자')
+  const thumbW = 96
+  const thumbH = 36
+  const labelW = 52
+  const innerW = w.width - thumbW - 10
+  const colW = innerW / 2
   for (const s of signers) {
-    const srows: [string, string][] = [
-      ['이름 / Name', `${s.name}${s.is_owner ? '  (발신자 / Owner)' : ''}`],
-      ['이메일 / Email', s.email],
-      ['순서 / Order', String(s.order_index + 1)],
-      ['서명 시각 / Signed at', kstDateTime(s.signed_at)],
-      ['IP 주소 / IP', s.ip ?? '-'],
-      ['브라우저 / User agent', s.user_agent ?? '-'],
-    ]
-    const size = 8.5
-    w.ensure(Math.max(w.measureRows(srows, size, valueW), thumbH) + 12)
+    const nameLine = `${s.order_index + 1}. ${s.name}${s.is_owner ? ' (발신자)' : ''}`
+    const uaLines = wrap(font, s.user_agent ?? '-', BODY, innerW - labelW)
+    const blockH = Math.max(LH * 3 + uaLines.length * LH + 4, thumbH + 4)
+    w.ensure(blockH + 6)
     const top = w.y
-    // Signature thumbnail on the right
+    // signature thumbnail (right)
     const tx = M + w.width - thumbW
-    const ty = top - thumbH
-    w.page.drawRectangle({ x: tx, y: ty, width: thumbW, height: thumbH, borderColor: RULE, borderWidth: 0.7 })
+    const ty = top - thumbH - 1
+    w.page.drawRectangle({ x: tx, y: ty, width: thumbW, height: thumbH, borderColor: RULE, borderWidth: 0.6 })
     const img = sigImages.get(s.id)
     if (img) {
-      const sc = Math.min((thumbW - 8) / img.width, (thumbH - 8) / img.height)
+      const sc = Math.min((thumbW - 6) / img.width, (thumbH - 6) / img.height)
       const iw = img.width * sc
       const ih = img.height * sc
       w.page.drawImage(img, { x: tx + (thumbW - iw) / 2, y: ty + (thumbH - ih) / 2, width: iw, height: ih })
     }
-    w.rows(srows, labelW, size, valueW)
-    w.y = Math.min(w.y, top - thumbH) - 6
-    w.page.drawLine({ start: { x: M, y: w.y }, end: { x: M + w.width, y: w.y }, thickness: 0.4, color: RULE })
-    w.y -= 6
+    w.text(nameLine, M, 8.5)
+    w.y -= LH + 2
+    w.cell('이메일', s.email, M, labelW, colW - labelW - 6)
+    w.cell('서명 시각', kstDateTime(s.signed_at), M + colW, labelW, colW - labelW - 6)
+    w.y -= LH
+    w.cell('IP 주소', s.ip ?? '-', M, labelW, colW - labelW - 6)
+    w.y -= LH
+    w.cell('브라우저', s.user_agent ?? '-', M, labelW, innerW - labelW)
+    w.y -= uaLines.length * LH
+    w.y = Math.min(w.y, top - thumbH - 2) - 4
+    w.rule()
+    w.y -= 5
   }
 
-  w.heading('이벤트 기록', 'Event log')
+  w.heading('이벤트 기록')
   const cols = [
-    { title: '시각 (KST) / Time', w: 118 },
-    { title: '이벤트 / Event', w: 92 },
-    { title: '서명자 / Signer', w: 80 },
-    { title: 'IP', w: 80 },
-    { title: '상세 / Detail', w: w.width - 118 - 92 - 80 - 80 },
+    { title: '시각 (KST)', w: 92 },
+    { title: '이벤트', w: 50 },
+    { title: '서명자', w: 80 },
+    { title: 'IP', w: 88 },
+    { title: '상세', w: w.width - 92 - 50 - 80 - 88 },
   ]
-  const size = 7.5
-  const lh = size * 1.4
   const drawHeader = () => {
-    w.ensure(lh + 4)
+    w.ensure(LH + 3)
     let x = M
     for (const c of cols) {
-      w.text(c.title, x, size, MUTED)
+      w.text(c.title, x, BODY, MUTED)
       x += c.w
     }
-    w.y -= lh + 3
+    w.y -= LH + 2
   }
   drawHeader()
   const signerName = new Map(signers.map((s) => [s.id, s.name]))
   for (const e of events) {
+    // Details already shown elsewhere on the page are dropped to keep rows on one line.
+    const detail = e.type === 'created' || e.type === 'signed' || e.type === 'viewed' ? '' : (e.detail ?? '')
     const cells = [
       kstDateTime(e.at).replace(' KST', ''),
       EVENT_LABEL[e.type] ?? e.type,
       e.signer_id ? (signerName.get(e.signer_id) ?? '-') : '-',
       e.ip ?? '-',
-      e.detail ?? '',
-    ].map((v, i) => wrap(font, v, size, cols[i].w - 6))
-    const rowH = Math.max(...cells.map((c) => c.length)) * lh + 3
-    if (w.y - rowH < M + 14) {
+      detail,
+    ].map((v, i) => wrap(font, v, BODY, cols[i].w - 5))
+    const rowH = Math.max(...cells.map((c) => c.length)) * LH + 1
+    if (w.y - rowH < M + 12) {
       w.newPage()
       drawHeader()
     }
@@ -361,27 +384,24 @@ function drawAuditCertificate(
     cells.forEach((lines, i) => {
       let yy = top
       for (const l of lines) {
-        w.page.drawText(l, { x, y: yy - size, size, font, color: INK })
-        yy -= lh
+        w.page.drawText(l, { x, y: yy - BODY, size: BODY, font, color: INK })
+        yy -= LH
       }
       x += cols[i].w
     })
     w.y = top - rowH
-    w.page.drawLine({ start: { x: M, y: w.y + 1 }, end: { x: M + w.width, y: w.y + 1 }, thickness: 0.3, color: RULE })
   }
+  w.y -= 2
+  w.rule()
 
-  w.heading('무결성', 'Integrity')
-  const statement = [
-    '이 문서는 모든 서명자의 서명 완료 후 생성되었으며, 원본 페이지와 서명 값, 본 감사 증명서 전체가 PAdES 전자서명(자체 서명 인증서 "pdf-esign self-signed", SHA-256)으로 봉인되어 있습니다. 봉인 이후 내용이 한 바이트라도 변경되면 PDF 뷰어의 서명 검증이 실패합니다. 최종 파일의 SHA-256 해시는 서버에 기록됩니다.',
-    'This document was sealed after all signers completed. The original pages, the stamped values and this certificate are covered by an embedded PAdES digital signature (self-signed certificate "pdf-esign self-signed", SHA-256); any modification after sealing invalidates the signature in PDF viewers. The SHA-256 hash of the final file is recorded on the server.',
-  ]
-  for (const para of statement) {
-    for (const l of wrap(font, para, 8.5, w.width)) {
-      w.ensure(13)
-      w.text(l, M, 8.5)
-      w.y -= 12.5
-    }
-    w.y -= 6
+  // Integrity note (single Korean paragraph)
+  w.y -= 8
+  const note =
+    '무결성: 이 문서는 모든 서명 완료 후 원본 페이지·서명 값·본 증명서 전체를 PAdES 전자서명(SHA-256)으로 봉인했습니다. 봉인 후 한 바이트라도 바뀌면 PDF 뷰어의 서명 검증이 실패합니다. 최종 파일의 SHA-256은 서버에 기록됩니다.'
+  for (const l of wrap(font, note, 7, w.width)) {
+    w.ensure(10)
+    w.text(l, M, 7, MUTED)
+    w.y -= 9.5
   }
 
   w.footer(d.id)
