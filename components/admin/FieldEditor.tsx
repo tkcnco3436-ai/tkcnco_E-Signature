@@ -96,6 +96,8 @@ export default function FieldEditor({
   const [signers, setSigners] = useState<EdSigner[]>(initial.signers)
   const [fields, setFields] = useState<EdField[]>(initial.fields)
   const [activeKey, setActiveKey] = useState<string>(initial.signers[0]?.key ?? '')
+  const [dragKey, setDragKey] = useState<string | null>(null)
+  const signerListRef = useRef<HTMLOListElement>(null)
   const [tool, setTool] = useState<FieldType | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   const [pageCount, setPageCount] = useState<number>(bundle.document.page_count)
@@ -268,6 +270,31 @@ export default function FieldEditor({
     setSigners((ss) => {
       const next = [...ss]
       ;[next[i], next[j]] = [next[j], next[i]]
+      return next
+    })
+    touch()
+  }
+
+  // Drag-and-drop reorder (pointer events: mouse, touch, pen). Arrow buttons remain for keyboard users.
+  function dragMove(e: React.PointerEvent<HTMLElement>) {
+    if (!dragKey || !signerListRef.current) return
+    const from = signers.findIndex((s) => s.key === dragKey)
+    if (from < 0) return
+    const items = Array.from(signerListRef.current.children) as HTMLElement[]
+    const others = items.filter((_, idx) => idx !== from)
+    let pos = others.length
+    for (let idx = 0; idx < others.length; idx++) {
+      const r = others[idx].getBoundingClientRect()
+      if (e.clientY < r.top + r.height / 2) {
+        pos = idx
+        break
+      }
+    }
+    if (pos === from) return
+    setSigners((ss) => {
+      const dragged = ss[from]
+      const next = ss.filter((_, idx) => idx !== from)
+      next.splice(pos, 0, dragged)
       return next
     })
     touch()
@@ -539,18 +566,53 @@ export default function FieldEditor({
               서명자 <span className="font-normal text-[var(--muted)]">(서명 순서)</span>
             </h2>
           </div>
-          <p className="mb-3 text-xs text-[var(--muted)]">위에서부터 순서대로 서명합니다.</p>
-          <ol className="space-y-3">
+          <p className="mb-3 text-xs text-[var(--muted)]">위에서부터 순서대로 서명합니다. 손잡이를 끌어 순서를 바꿀 수 있습니다.</p>
+          <ol ref={signerListRef} className="space-y-3">
             {signers.map((s, i) => {
               const c = counts.get(s.key) ?? { sig: 0, other: 0 }
               const color = signerColor(i)
               const isActive = s.key === active?.key
+              const isDragging = dragKey === s.key
               return (
                 <li
                   key={s.key}
-                  className={`rounded-md border p-2.5 ${isActive ? 'border-[var(--accent)]/50 bg-neutral-50' : 'border-[var(--line)]'}`}
+                  className={`rounded-md border p-2.5 transition-shadow ${
+                    isDragging
+                      ? 'relative z-10 border-[var(--accent)] bg-white shadow-lg ring-2 ring-[var(--accent)]/30'
+                      : isActive
+                        ? 'border-[var(--accent)]/50 bg-neutral-50'
+                        : 'border-[var(--line)]'
+                  }`}
                 >
                   <div className="mb-2 flex items-center gap-2">
+                    <span
+                      role="button"
+                      tabIndex={-1}
+                      aria-label={`${i + 1}번 서명자 끌어서 순서 변경`}
+                      title="끌어서 순서 변경"
+                      className={`-ml-1 flex h-8 w-6 shrink-0 select-none items-center justify-center rounded text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700 ${
+                        isDragging ? 'cursor-grabbing' : 'cursor-grab'
+                      }`}
+                      style={{ touchAction: 'none' }}
+                      onPointerDown={(e) => {
+                        if (e.button !== 0 && e.pointerType === 'mouse') return
+                        e.preventDefault()
+                        e.currentTarget.setPointerCapture(e.pointerId)
+                        setDragKey(s.key)
+                      }}
+                      onPointerMove={dragMove}
+                      onPointerUp={() => setDragKey(null)}
+                      onPointerCancel={() => setDragKey(null)}
+                    >
+                      <svg width="12" height="16" viewBox="0 0 12 16" fill="currentColor" aria-hidden>
+                        <circle cx="3" cy="3" r="1.4" />
+                        <circle cx="9" cy="3" r="1.4" />
+                        <circle cx="3" cy="8" r="1.4" />
+                        <circle cx="9" cy="8" r="1.4" />
+                        <circle cx="3" cy="13" r="1.4" />
+                        <circle cx="9" cy="13" r="1.4" />
+                      </svg>
+                    </span>
                     <span className="h-3 w-3 shrink-0 rounded-full" style={{ background: color }} aria-hidden />
                     <span className="text-xs font-medium tabular-nums">{i + 1}</span>
                     {s.is_owner && (

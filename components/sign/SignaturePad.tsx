@@ -22,13 +22,55 @@ export interface SignaturePadProps {
   adoptLabel?: string
 }
 
-type Mode = 'draw' | 'type'
+type Mode = 'draw' | 'type' | 'stamp'
+
+const MODE_LABEL: Record<Mode, string> = { draw: '직접 그리기', type: '이름 입력', stamp: '도장 이미지' }
+const STAMP_MAX_SIDE = 800 // px, longest side of the processed stamp
+const STAMP_MAX_FILE = 10 * 1024 * 1024 // raw upload limit (processed result is much smaller)
+const MAX_DATA_URL_CHARS = 640_000 // ~480 KB decoded; server limit is 500 KB
 
 export default function SignaturePad({ onAdopt, onCancel, defaultName = '', adoptLabel = '서명 적용' }: SignaturePadProps) {
   const [mode, setMode] = useState<Mode>('draw')
   const [typed, setTyped] = useState(defaultName)
   const [hasInk, setHasInk] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Stamp mode: the decoded source image, whether to knock out the white background, and the processed result.
+  const [stampImg, setStampImg] = useState<HTMLImageElement | null>(null)
+  const [removeBg, setRemoveBg] = useState(true)
+  const [stampPng, setStampPng] = useState<string | null>(null)
+  const [stampBusy, setStampBusy] = useState(false)
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    if (!stampImg) {
+      setStampPng(null)
+      return
+    }
+    setStampPng(processStamp(stampImg, removeBg))
+  }, [stampImg, removeBg])
+
+  const onStampFile = async (file: File | undefined) => {
+    setError(null)
+    if (!file) return
+    if (!/^image\/(png|jpeg|webp|gif|bmp)$/.test(file.type)) return setError('PNG, JPG, WEBP 이미지만 사용할 수 있습니다.')
+    if (file.size > STAMP_MAX_FILE) return setError('이미지가 너무 큽니다. 10MB 이하로 올려 주세요.')
+    setStampBusy(true)
+    try {
+      const url = URL.createObjectURL(file)
+      try {
+        const img = new Image()
+        img.src = url
+        await img.decode()
+        setStampImg(img)
+      } finally {
+        URL.revokeObjectURL(url)
+      }
+    } catch {
+      setError('이미지를 읽지 못했습니다. 다른 파일을 선택해 주세요.')
+    } finally {
+      setStampBusy(false)
+    }
+  }
 
   const wrapRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -207,11 +249,19 @@ export default function SignaturePad({ onAdopt, onCancel, defaultName = '', adop
     current.current = null
     setHasInk(false)
     if (mode === 'type') setTyped('')
+    if (mode === 'stamp') {
+      setStampImg(null)
+      if (fileRef.current) fileRef.current.value = ''
+    }
     setError(null)
     redraw()
   }
 
   const adopt = () => {
+    if (mode === 'stamp') {
+      if (!stampPng) return setError('도장 이미지를 선택해 주세요.')
+      return onAdopt(stampPng)
+    }
     const canvas = canvasRef.current
     if (!canvas) return
     if (mode === 'draw' && !hasInk) return setError('서명을 그려 주세요.')
@@ -221,12 +271,12 @@ export default function SignaturePad({ onAdopt, onCancel, defaultName = '', adop
     onAdopt(png)
   }
 
-  const ready = mode === 'draw' ? hasInk : typed.trim().length > 0
+  const ready = mode === 'draw' ? hasInk : mode === 'type' ? typed.trim().length > 0 : !!stampPng
 
   return (
     <div className="flex flex-col gap-3">
-      <div role="tablist" aria-label="서명 방식" className="grid grid-cols-2 rounded-md border border-[var(--line)] bg-neutral-50 p-1 text-sm">
-        {(['draw', 'type'] as const).map((m) => (
+      <div role="tablist" aria-label="서명 방식" className="grid grid-cols-3 rounded-md border border-[var(--line)] bg-neutral-50 p-1 text-sm">
+        {(['draw', 'type', 'stamp'] as const).map((m) => (
           <button
             key={m}
             type="button"
@@ -240,10 +290,68 @@ export default function SignaturePad({ onAdopt, onCancel, defaultName = '', adop
               mode === m ? 'bg-white text-[var(--fg)] shadow-sm ring-1 ring-[var(--line)]' : 'text-[var(--muted)] hover:text-[var(--fg)]'
             }`}
           >
-            {m === 'draw' ? '직접 그리기' : '이름 입력'}
+            {MODE_LABEL[m]}
           </button>
         ))}
       </div>
+
+      {mode === 'stamp' && (
+        <div className="flex flex-col gap-2 text-sm">
+          <input
+            ref={fileRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            className="sr-only"
+            id="stamp-file"
+            onChange={(e) => void onStampFile(e.target.files?.[0])}
+          />
+          <div
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => {
+              e.preventDefault()
+              void onStampFile(e.dataTransfer.files?.[0])
+            }}
+            className="relative flex min-h-[180px] items-center justify-center overflow-hidden rounded-md border border-dashed border-neutral-300"
+            style={{
+              // Checkerboard so the transparent background is visible.
+              backgroundColor: '#fff',
+              backgroundImage:
+                'linear-gradient(45deg,#f1f1ef 25%,transparent 25%),linear-gradient(-45deg,#f1f1ef 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#f1f1ef 75%),linear-gradient(-45deg,transparent 75%,#f1f1ef 75%)',
+              backgroundSize: '16px 16px',
+              backgroundPosition: '0 0,0 8px,8px -8px,-8px 0',
+            }}
+          >
+            {stampPng ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={stampPng} alt="도장 미리보기" className="max-h-[160px] max-w-[85%] object-contain" />
+            ) : (
+              <label htmlFor="stamp-file" className="flex cursor-pointer flex-col items-center gap-1 px-4 py-6 text-center text-neutral-500">
+                <span className="font-medium text-[var(--fg)]">{stampBusy ? '불러오는 중...' : '도장 이미지 선택'}</span>
+                <span className="text-xs">PNG·JPG 사진 또는 스캔본. 흰 배경은 자동으로 지웁니다.</span>
+              </label>
+            )}
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <label className="flex min-h-11 items-center gap-2">
+              <input
+                type="checkbox"
+                checked={removeBg}
+                onChange={(e) => setRemoveBg(e.target.checked)}
+                className="h-4 w-4 accent-[var(--accent)]"
+              />
+              흰 배경 제거
+            </label>
+            {stampPng && (
+              <label
+                htmlFor="stamp-file"
+                className="flex min-h-11 cursor-pointer items-center rounded-md border border-[var(--line)] bg-white px-4 font-medium hover:bg-neutral-50"
+              >
+                다른 이미지
+              </label>
+            )}
+          </div>
+        </div>
+      )}
 
       {mode === 'type' && (
         <label className="flex flex-col gap-1 text-sm">
@@ -262,7 +370,8 @@ export default function SignaturePad({ onAdopt, onCancel, defaultName = '', adop
         </label>
       )}
 
-      <div ref={wrapRef} className="relative w-full">
+      {/* Canvas stays mounted in stamp mode (size/ref effects), just hidden. */}
+      <div ref={wrapRef} className={`relative w-full ${mode === 'stamp' ? 'hidden' : ''}`}>
         <canvas
           ref={canvasRef}
           role="img"
@@ -318,6 +427,49 @@ export default function SignaturePad({ onAdopt, onCancel, defaultName = '', adop
       </div>
     </div>
   )
+}
+
+// Scale a stamp photo/scan down, optionally make near-white pixels transparent (soft edge),
+// crop empty margins and return a PNG data URL that fits the server limit.
+function processStamp(img: HTMLImageElement, removeBg: boolean): string | null {
+  let side = STAMP_MAX_SIDE
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const scale = Math.min(1, side / Math.max(img.naturalWidth, img.naturalHeight))
+    const w = Math.max(1, Math.round(img.naturalWidth * scale))
+    const h = Math.max(1, Math.round(img.naturalHeight * scale))
+    const c = document.createElement('canvas')
+    c.width = w
+    c.height = h
+    const ctx = c.getContext('2d', { willReadFrequently: true })
+    if (!ctx) return null
+    ctx.imageSmoothingQuality = 'high'
+    ctx.drawImage(img, 0, 0, w, h)
+    if (removeBg) {
+      const id = ctx.getImageData(0, 0, w, h)
+      const d = id.data
+      // Lightness/saturation knock-out: paper is bright and unsaturated, red ink is not.
+      const LO = 200
+      const HI = 240
+      for (let i = 0; i < d.length; i += 4) {
+        const r = d[i]
+        const g = d[i + 1]
+        const b = d[i + 2]
+        const max = Math.max(r, g, b)
+        const min = Math.min(r, g, b)
+        const light = (r + g + b) / 3
+        const sat = max === 0 ? 0 : (max - min) / max
+        if (sat > 0.25) continue // clearly colored ink: keep
+        if (light >= HI) d[i + 3] = 0
+        else if (light > LO) d[i + 3] = Math.round((d[i + 3] * (HI - light)) / (HI - LO))
+      }
+      ctx.putImageData(id, 0, 0)
+    }
+    const out = exportTrimmedPng(c)
+    if (!out) return null
+    if (out.length <= MAX_DATA_URL_CHARS) return out
+    side = Math.round(side * 0.75)
+  }
+  return null
 }
 
 function mid(a: Pt, b: Pt): Pt {
