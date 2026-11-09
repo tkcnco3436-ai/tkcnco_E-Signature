@@ -8,9 +8,11 @@ import type { DocumentRow, SignerRow } from './types'
 // Email OTP identity check for signers.
 // The code itself is never stored or returned: only HMAC-SHA256(code, SESSION_SECRET + signer.id).
 
-export const OTP_TTL_MS = 10 * 60_000
+// The signer page requests a code automatically when the signer starts signing, so the mail
+// arrives while they draw. 5 min is enough for that window; expired codes are re-requested in the sheet.
+export const OTP_TTL_MS = 5 * 60_000
 export const OTP_MAX_ATTEMPTS = 5
-export const OTP_RESEND_COOLDOWN_MS = 60_000
+export const OTP_RESEND_COOLDOWN_MS = 30_000
 export const OTP_MAX_SENDS_PER_HOUR = 5
 export const OTP_VERIFIED_VALID_MS = 30 * 60_000
 

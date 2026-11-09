@@ -545,7 +545,7 @@ log('void/delete')
 
   await expectOtpError(() => wf.verifySignerOtp(t4, '123456', info), 410)
   const sent1 = await wf.requestSignerOtp(t4, info)
-  assert.deepEqual(sent1, { expires_in: 600, resend_in: 60 })
+  assert.deepEqual(sent1, { expires_in: 300, resend_in: 30 })
   assert.ok(!JSON.stringify(sent1).match(/\d{6}/), 'code never returned')
   const cd = await expectOtpError(wf.requestSignerOtp(t4, info), 429)
   assert.ok(cd.retryAfter! >= 1 && cd.retryAfter! <= 60, `retryAfter ${cd.retryAfter}`)

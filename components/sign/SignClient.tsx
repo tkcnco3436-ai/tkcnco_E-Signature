@@ -192,7 +192,31 @@ function SignForm({ data, base, onDone }: { data: SignViewResponse; base: string
   const [editingId, setEditingId] = useState<string | null>(null)
   const [otpVerified, setOtpVerified] = useState(data.otp.verified)
   const [otpOpen, setOtpOpen] = useState(false)
+  // Code requested automatically when the signer first opens the signature pad (mail arrives while they sign).
+  const [otpAuto, setOtpAuto] = useState<{ at: number; resendIn: number; expiresIn: number } | null>(null)
+  const otpAutoTried = useRef(false)
   const consentRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    if (!padOpen || otpAutoTried.current || !data.otp.required || otpVerified) return
+    otpAutoTried.current = true
+    void (async () => {
+      try {
+        const res = await fetch(`${base}/otp`, { method: 'POST' })
+        const json = await res.json().catch(() => null)
+        // 429 = a code was sent moments ago (e.g. page reload): treat it as sent.
+        if (res.ok || res.status === 429) {
+          setOtpAuto({
+            at: Date.now(),
+            resendIn: typeof json?.resend_in === 'number' ? json.resend_in : typeof json?.retry_after === 'number' ? json.retry_after : 30,
+            expiresIn: typeof json?.expires_in === 'number' ? json.expires_in : 300,
+          })
+        }
+      } catch {
+        /* silent: the OTP sheet still lets the signer request a code */
+      }
+    })()
+  }, [padOpen, data.otp.required, otpVerified, base])
   const textFields = useMemo(() => myFields.filter((f) => f.type !== 'signature'), [myFields])
 
   // Bring a field into the upper part of the screen so the bottom sheet does not cover it.
@@ -400,6 +424,7 @@ function SignForm({ data, base, onDone }: { data: SignViewResponse; base: string
         <OtpSheet
           base={base}
           emailMasked={data.otp.email_masked}
+          autoSent={otpAuto}
           onClose={() => setOtpOpen(false)}
           onVerified={() => {
             setOtpVerified(true)
@@ -627,20 +652,35 @@ function FieldSheet({
 function OtpSheet({
   base,
   emailMasked,
+  autoSent,
   onVerified,
   onClose,
 }: {
   base: string
   emailMasked: string
+  autoSent: { at: number; resendIn: number; expiresIn: number } | null
   onVerified: () => void
   onClose: () => void
 }) {
-  const [sent, setSent] = useState(false)
-  const [cooldown, setCooldown] = useState(0)
+  // If a code went out automatically when signing started and has not expired, open in the "sent" state.
+  const autoElapsed = autoSent ? Math.floor((Date.now() - autoSent.at) / 1000) : 0
+  const autoValid = !!autoSent && autoElapsed < autoSent.expiresIn
+  const [sent, setSent] = useState(autoValid)
+  const [cooldown, setCooldown] = useState(autoValid && autoSent ? Math.max(0, autoSent.resendIn - autoElapsed) : 0)
   const [code, setCode] = useState('')
   const [busy, setBusy] = useState<'send' | 'verify' | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [info, setInfo] = useState<string | null>(null)
+  const [info, setInfo] = useState<string | null>(
+    autoValid
+      ? '서명을 시작할 때 인증번호를 메일로 보냈습니다. 메일함(스팸함 포함)을 확인하세요. 5분간 유효하며, 만료되면 다시 받을 수 있습니다.'
+      : autoSent
+        ? '앞서 보낸 인증번호가 만료되었습니다. 새 인증번호를 받아 주세요.'
+        : null,
+  )
+  useEffect(() => {
+    if (autoValid) window.setTimeout(() => inputRef.current?.focus(), 50)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
   const inputRef = useRef<HTMLInputElement>(null)
   const closeRef = useRef(onClose)
   closeRef.current = onClose
@@ -685,8 +725,8 @@ function OtpSheet({
       }
       setSent(true)
       setCode('')
-      setCooldown(typeof json?.resend_in === 'number' ? json.resend_in : 60)
-      setInfo('인증번호를 보냈습니다. 메일함(스팸함 포함)을 확인하세요. 10분간 유효합니다.')
+      setCooldown(typeof json?.resend_in === 'number' ? json.resend_in : 30)
+      setInfo('인증번호를 보냈습니다. 메일함(스팸함 포함)을 확인하세요. 5분간 유효합니다.')
       window.setTimeout(() => inputRef.current?.focus(), 0)
     } catch {
       setError('네트워크 오류로 인증번호를 보내지 못했습니다.')

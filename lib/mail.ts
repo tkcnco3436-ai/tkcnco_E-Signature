@@ -194,13 +194,13 @@ export function otpEmail(doc: DocumentRow, signer: SignerRow, code: string): Mai
 <h1 style="margin:0 0 16px 0;font-size:20px;">이메일 본인 확인</h1>
 <p style="margin:0 0 8px 0;">${escapeHtml(signer.name)}님, <strong>${escapeHtml(doc.title)}</strong> 문서 서명을 위한 인증번호입니다.</p>
 <p style="margin:20px 0;font-size:34px;font-weight:700;letter-spacing:8px;font-family:Consolas,Menlo,monospace;color:#1f2328;">${safeCode}</p>
-<p style="margin:0 0 8px 0;">서명 화면에 위 6자리 숫자를 입력하세요. 인증번호는 10분간 유효합니다.</p>
+<p style="margin:0 0 8px 0;">서명 화면에 위 6자리 숫자를 입력하세요. 인증번호는 5분간 유효합니다.</p>
 <p style="margin:0 0 8px 0;font-size:13px;color:#57606a;">본인이 요청하지 않았다면 이 메일을 무시하세요.</p>`)
   const text = `${signer.name}님, "${doc.title}" 문서 서명을 위한 인증번호입니다.
 
 인증번호: ${safeCode}
 
-서명 화면에 위 6자리 숫자를 입력하세요. 인증번호는 10분간 유효합니다.
+서명 화면에 위 6자리 숫자를 입력하세요. 인증번호는 5분간 유효합니다.
 본인이 요청하지 않았다면 이 메일을 무시하세요.`
   return { subject, html, text }
 }
