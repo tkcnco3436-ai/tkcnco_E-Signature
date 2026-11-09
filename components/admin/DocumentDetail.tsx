@@ -220,6 +220,16 @@ export default function DocumentDetail({ bundle, links }: { bundle: DocumentBund
         )}
       </div>
 
+      {ownerTurn && owner && (() => {
+        const nextSigner = signers.find((s) => s.order_index > owner.order_index && s.status !== 'signed')
+        return (
+          <p role="status" className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+            지금은 내 서명 차례입니다. 순차 서명이라 아직 다른 서명자에게 메일이 가지 않았습니다.
+            {nextSigner ? ` 내가 서명을 마치면 ${nextSigner.name}(${nextSigner.email})님에게 서명 요청 메일이 자동 발송됩니다.` : ''}
+          </p>
+        )
+      })()}
+
       {/* Primary actions */}
       <div className="flex flex-wrap gap-2">
         {ownerTurn && owner && (
